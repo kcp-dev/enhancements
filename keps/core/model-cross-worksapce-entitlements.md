@@ -47,8 +47,8 @@ not only cheap multi-tenancy through workspaces but also allowing users to model
 cross-workspace concerns. While a fleet of entirely independent workspaces has
 value, it's these cross-workspace interactions that are uniquely possible in `kcp`.
 One common type of cross-workspace interaction is a provider/consumer split - one
-actor or set of actors provide some service through content in their workspace, and
-others using the system can consume that service. Examples of this relationship include:
+actor provides some service through content in their workspace, and others using
+the system can consume that service. Examples of this relationship include:
 
  - `APIExports`, used via `APIBindings` from the `apis.kcp.io` group
  - `WorkspaceTypes`, used in creating `Workspaces` from the `tenancy.kcp.io` group
@@ -56,7 +56,7 @@ others using the system can consume that service. Examples of this relationship 
 
 Naturally, providers of these functionalities would like to manage where their services
 can be used. Today, restricting access to the provider's service is done in an ad-hoc
-manner (or not implementded at all!), for example with `APIExports` the flow looks like:
+manner (or not implemented at all!), for example with `APIExports` the flow looks like:
 
  - create RBAC in the `APIExport` workspace that provides `verb="bind"` access to the
    particular `APIExport` name in question
@@ -77,7 +77,9 @@ in-tree uses as well as user-provided extensions.
 1. Model entitlements to cross-workspace concerns in a generic manner
 1. Enable entitlement checking in a non-privileged manner
 1. Provide an implementation for entitlement checking that suffices for bootstrapping
-1. Simplify the `kcp` authorizer chain by removing non-Kubernetes, non-RBAC concepts
+1. Enable users to plug in custom, scalable implementations trivially
+1. Simplify the `kcp` authorizer chain by removing non-Kubernetes, non-RBAC concepts like
+   the workspace authorizer and "deep" SubjectAccessReviews
 
 ### Non-Goals
 
@@ -96,7 +98,7 @@ cross-workspace concepts on top of `kcp` will be able to write admission _webhoo
 that use this API to implement restrictions to the use of their concepts.
 
 Additionally, a default implemenation will be provided for `kcp start` to allow for
-boot-strappiung the system. This implemenation will be self-sufficient at small scales,
+bootstrappiung the system. This implemenation will be self-sufficient at small scales,
 but the expectation will be that users with more complex entitlement models will use
 third-party systems based on more performant databases to implement their entitlement
 reviews. 
@@ -202,7 +204,7 @@ type Entitlement struct {
 type EntitlementReviewStatus struct {
     // Entitled is required. True if the entitlement is granted, false otherwise.
     Entitled bool `json:"entitled"`
-    // Disqualified is optional. True if the entitlement  is not granted, otherwise
+    // Disqualified is optional. True if the entitlement is not granted, otherwise
     // false. If both entitled is false and disqualified is false, then the
     // reviewer has no opinion on whether to grant the entitlement. Disqualified
     // may not be true if entitled is true.
@@ -453,7 +455,7 @@ cardinality and remove the need to cache policy bindings that do not implicate c
 those entitlement policy bindings which _do_ set `"children":true`, replication using the cache
 server will be required.
 
-A server will also exists that can field entitlement review requests. This server will entirely
+A server will also exist that can field entitlement review requests. This server will entirely
 ignore the `userInfo` section of the entitlement review request, and only operate on the request
 information. A simple deep equality will be done to determine if an entitlement in the request
 matches one in a policy.
