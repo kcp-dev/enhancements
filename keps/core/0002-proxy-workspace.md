@@ -15,6 +15,24 @@ responsible for ArgoCD, Crossplane, or other infrastructure that is more crd-bas
 At this point in time communication between kcp and remote clusters is done via
 workspaces abstractions.
 
+In example:
+```
+$ kubectl ws tree
+root:
+root
+  ├── clusters (workspace)
+  │   ├── cluster-proxy (proxy object but shown as a workspace in tree)
+  │   ├── cluster-1 (workspace)
+  ├── infra (workspace)
+  │   ├── argocd (workspace)
+  │   ├── crossplane (workspace)
+```
+
+Where `cluster-proxy` is a workspace that is backed by a proxy that can be used
+to proxy requests to remote clusters. This way we have unified way of interacting
+with remote clusters, but still have ability to manage some of the infrastructure
+via kcp.
+
 ### Goals
 
 1. Agree how to make proxy functionality as pluggable as possible.
