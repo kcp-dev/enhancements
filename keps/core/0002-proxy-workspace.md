@@ -26,6 +26,9 @@ root
   ├── infra (workspace)
   │   ├── argocd (workspace)
   │   ├── crossplane (workspace)
+  ├── tmc (tmc workspace)
+  │   ├── cluster1 (TMC workspace)
+  ...
 ```
 
 Where `cluster-proxy` is a workspace that is backed by a proxy that can be used
