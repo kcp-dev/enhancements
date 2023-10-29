@@ -111,6 +111,34 @@ use it as a proxy as well by: `ws use root:clusters:cluster-proxy`.
 This would require some changes in the CLI to be able to detect that the workspace proxy
 object is present and use it instead of the workspace itself.
 
+## Option 3: Delegated workspace
+
+Suggestion is to add new api flag `--delegated-workspace-types` that would allow
+to specify which workspace types should be delegated to external process to manage.
+This flag would prevent any implementation of the workspace type in the kcp core
+and would allow to be managed from outside of the kcp core.
+
+We would introduce workspace type `Proxy` and add reconcilers for it.
+RBAC still need to be handled. For RBAC we still use `VirtualWorkspace` and store
+rbac artifacts (secret, service account, role, role binding) in the kcp cluster parent workspace
+together with `VirtualWorkspace` backing object.
+
+This way each child `proxy` workspace would need to correspond to an Proxy object:
+
+```
+apiVersion: proxy.kcp.io/v1alpha1
+kind: WorkspaceProxy
+metadata:
+   name: cluster-proxy
+spec:
+   type: passthrough
+```
+
+Where `WorkspaceProxy` object would expose `/tunnel` endpoint that would be used
+for reverse dialing to the proxy. The proxying itself would need to be implemented
+on Workspace level.
+
+
 #### Suggested action items
 
 1. Agree on the possible implementation options.
