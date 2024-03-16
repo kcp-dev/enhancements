@@ -56,6 +56,9 @@ Introduce experimental `Mount` API to enable 2 use cases:
 2. Softlink - mounting other workspaces as sub-workspaces, where changing the sub-workspace
    would change the parent workspace as well.
 
+Initially we would put `Mount` into annotation of the workspace, but in the future
+we will promote it to spec of the workspace.
+
 ### Mount API
 
 ```go
