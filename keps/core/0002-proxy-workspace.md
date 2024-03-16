@@ -1,10 +1,11 @@
-# Proxy workspace enhancement proposal
+# Workspace mounts enhancement proposal
 
 ## Summary
 
 To extend spectrum of use cases for kcp, we need to support workspaces that are not
-backed by a kcp cluster itself, but are backed by a proxy that can be used to proxy
-request to remote cluster directly, without having to go through kcp workspace.
+backed by a kcp cluster itself, but are backed by a mount that can be used to proxy
+request to remote cluster directly or other workspaces. This enables use cases where
+we can start adding external & internal integration into same workspace structure.
 
 ## Motivation
 
@@ -26,106 +27,92 @@ root
   ├── infra (workspace)
   │   ├── argocd (workspace)
   │   ├── crossplane (workspace)
-  ├── tmc (tmc workspace)
-  │   ├── cluster1 (TMC workspace)
   ...
 ```
 
-Where `cluster-proxy` is a workspace that is backed by a proxy that can be used
+Where `cluster-mount` is a workspace that is backed by a mount that can be used
 to proxy requests to remote clusters. This way we have unified way of interacting
 with remote clusters, but still have ability to manage some of the infrastructure
 via kcp.
 
 ### Goals
 
-1. Agree how to make proxy functionality as pluggable as possible.
-2. Agree on the scope of the proxy functionality.
-3. Agree on the implementation of the proxy functionality.
+1. Agree how to make mount functionality as pluggable as possible.
+2. Agree on the scope of the mount functionality.
+3. Agree on the implementation of the mount functionality.
 
 ### Non-Goals
 
-N/A
+Proxy/Mount functionality is not meant to be a replacement for the kcp clusters.
+In addition implementation of the mount functionality itself is out of scope of this
+proposal. We should enable the mount functionality to be implemented by 3rd party
+using kcp as a platform.
 
 ## Proposal
 
-Both options below would require a new `VirtualWorkspace` implementation that
-would be able to proxy requests to and from remote clusters. It would be in the separate
-`go module` to avoid introducing new dependencies to the core kcp and for easier split
-of the codebase.
+Introduce experimental `Mount` API to enable 2 use cases:
 
-### Option 1: Virtual workspace as a proxy
+1. Mounting remote clusters as workspaces
+2. Softlink - mounting other workspaces as sub-workspaces, where changing the sub-workspace
+   would change the parent workspace as well.
 
-Create a `VirtualWorkspace` implementation that would be able to proxy requests
-to and from remote clusters. This would be very similar to previous TMC syncer
-reverse tunnels that were used to proxy requests to remote clusters.
+### Mount API
 
-Remote cluster would have an agent that would be responsible for establishing
-a connection to the kcp cluster and would be responsible for proxying requests
-to and from the remote cluster.
+```go
 
-`https://192.168.1.136:6443/services/clusterproxy/root/cluster.proxy.kcp.io`
+// Mount is a workspace mount that can be used to mount a workspace into another workspace or resource.
+// Mounting itself is done at front proxy level.
+type Mount struct {
+	// MountSpec is the spec of the mount.
+	MountSpec MountSpec `json:"spec,omitempty"`
+	// MountStatus is the status of the mount.
+	MountStatus MountStatus `json:"status,omitempty"`
+}
 
-Proxy itself would be represented in a workspace via Cluster wide resource:
-```
-apiVersion: proxy.kcp.io/v1alpha1
-kind: ClusterProxy
-metadata:
-   name: cluster-proxy
-spec:
-   ...<TBC>...
-  status:
-    conditions:
-    - lastTransitionTime: "2023-10-07T15:30:12Z"
-      status: "True"
-      type: IdentityValid
-    - lastTransitionTime: "2023-10-07T15:30:12Z"
-      status: "True"
-      type: VirtualWorkspaceURLsReady
-    virtualWorkspaces:
-    - url: https://192.168.1.138:6443/services/clusterproxy/root/cluster.proxy.kcp.io
-```
+type MountSpec struct {
+	// Reference is an ObjectReference to the object that is mounted.
+	Reference *corev1.ObjectReference `json:"ref,omitempty"`
+  // Type is the type of the mount (URL, Redirect, Workspace).
+  // +kubebuilder:default=Cluster
+  Type MountType `json:"type,omitempty"`
+}
 
-Once this resource is created, it would be possible to create a pass-through
-connection. Where `ws use` could detect presence of the proxy and use it
-instead of the workspace itself. This would need to land somehow in the kcp core,
-similar how `homeWorkspaces` are handled.
+// MountStatus is the status of a mount. It is used to indicate the status of a mount,
+// potentially managed outside of the core API.
+type MountStatus struct {
+	// Phase of the mount (Initializing, Connecting, Ready, Unknown).
+	//
+	// +kubebuilder:default=Initializing
+	Phase MountPhaseType `json:"phase,omitempty"`
+	// Conditions is a list of conditions and their status.
+	// Current processing state of the Mount.
+	// +optional
+	Conditions conditionsv1alpha1.Conditions `json:"conditions,omitempty"`
 
-This basically removed users ability to manipulate the workspace directly, but
-we could still allow users to manipulate it via custom header allowing interact with the workspace.
-
-## Option 2: Sub-workspace
-
-Create a fake workspace view in the CLI. This would follow same `VirtualWorkspace`
-implementation as above, but would be represented as a sub-workspace. This would
-show as bellow:
-```
-$ kubectl ws tree
-root
-  ├── clusters (workspace)
-  │   ├── cluster-proxy (proxy object but shown as a workspace in tree)
+	// URL is the URL of the mount. Mount is considered mountable when URL is set.
+	// +optional
+	URL string `json:"url,omitempty"`
+}
 ```
 
-This way user can still manipulate the workspace directly, but would be able to
-use it as a proxy as well by: `ws use root:clusters:cluster-proxy`.
+Where `MountType` is an enum that would allow to specify the type of the mount:
+- `URL` - mount is backed by a URL and should be used as a proxy to remote cluster.
+- `Redirect` - mount is backed by another workspace and should be used as redirect to another workspace.
+- `Workspace` - mount is backed by another workspace and should be used as a proxy to another workspace.
 
-This would require some changes in the CLI to be able to detect that the workspace proxy
-object is present and use it instead of the workspace itself.
+`URL` implementation should be done outside of the kcp core, but we should provide
+via VirtualWorkspace.
 
-## Option 3: Delegated workspace
+`Redirect` and `Workspace` should be implemented in the kcp core.
 
-Suggestion is to add new api flag `--delegated-workspace-types` that would allow
-to specify which workspace types should be delegated to external process to manage.
-This flag would prevent any implementation of the workspace type in the kcp core
-and would allow to be managed from outside of the kcp core.
+`Reference` is a reference to the object that is mounted. It can be a reference to
+external object used to back the mount.
 
-We would introduce workspace type `Proxy` and add reconcilers for it.
-RBAC still need to be handled. For RBAC we still use `VirtualWorkspace` and store
-rbac artifacts (secret, service account, role, role binding) in the kcp cluster parent workspace
-together with `VirtualWorkspace` backing object.
+Object reference would be read by KCP core mount controller and update the status
+of the workspace. This way 3rd party components never need to interact with the
+kcp core or workspace directly in the write mode.
 
-This way each child `proxy` workspace would need to correspond to an Proxy object:
-
-```
+```yaml
 apiVersion: proxy.kcp.io/v1alpha1
 kind: WorkspaceProxy
 metadata:
@@ -134,17 +121,11 @@ spec:
    type: passthrough
 ```
 
-Where `WorkspaceProxy` object would expose `/tunnel` endpoint that would be used
-for reverse dialing to the proxy. The proxying itself would need to be implemented
-on Workspace level.
-
-
 #### Suggested action items
 
-1. Agree on the possible implementation options.
-2. TBC
-
+1. Agree on the scope of the mount functionality.
+2. Agree on the implementation of the mount functionality.
 
 #### Suggested timeline
 
-Completed in: EOF Q4 2024
+At the best effort basis.
