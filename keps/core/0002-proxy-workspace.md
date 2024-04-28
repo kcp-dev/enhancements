@@ -40,6 +40,8 @@ via kcp.
 1. Mounting remote clusters as workspaces
 2. Softlink - mounting other workspaces as sub-workspaces, where changing the sub-workspace
 would change the parent workspace as well.
+3. Workspace status propagation - when mounting workspace, there should be a way to
+propagate status to the workspace itself, preventing false positives serves.
 
 ### Non-Goals
 
@@ -116,6 +118,56 @@ type MountStatus struct {
 }
 ```
 
+#### Promoted Workspace API
+
+When mount is promoted to workspace spec, it could look like example bellow.
+Mount would be just yet another condition on the workspace. Most important change
+is that mount would be part of the workspace spec and if mount implementation would
+become unhealthy, it would be reflected in the workspace conditions. And this would drive
+`Phase` change of the workspace. More on this in the next section.
+
+```go
+// WorkspaceSpec defines the desired state of Workspace
+type WorkspaceSpec struct {
+	...
+	// Mount is a workspace mount that can be used to mount a workspace into another workspace or resource.
+	Mount *Mount `json:"mount,omitempty"`
+}
+
+// Mount is a workspace mount that can be used to mount a workspace into another workspace or resource.
+type Mount struct {
+	// Reference is an ObjectReference to the object that is mounted.
+	Reference *corev1.ObjectReference `json:"ref,omitempty"`
+	// Type is the type of the mount (URL, Redirect, Workspace).
+	// +kubebuilder:default=Cluster
+	Type MountType `json:"type,omitempty"`
+}
+
+// WorkspaceStatus defines the observed state of Workspace
+type WorkspaceStatus struct {
+	// Phase of the workspace (Scheduling, Initializing, Ready).
+	//
+	// +kubebuilder:default=Scheduling
+	Phase corev1alpha1.LogicalClusterPhaseType `json:"phase,omitempty"`
+
+	// Current processing state of the Workspace.
+	// +optional
+	Conditions conditionsv1alpha1.Conditions `json:"conditions,omitempty"`
+
+	// initializers must be cleared by a controller before the workspace is ready
+	// and can be used.
+	//
+	// +optional
+	Initializers []corev1alpha1.LogicalClusterInitializer `json:"initializers,omitempty"`
+
+	// MountURL is the URL of the mount. Mount is considered mounted when URL is set.
+	// +optional
+	MountURL string `json:"mountURL,omitempty"`
+}
+```
+
+#### Type explanations
+
 Where `MountType` is an enum that would allow to specify the type of the mount:
 - `Proxy` - mount is backed by a URL and should be used as a proxy to remote cluster.
 - `Redirect` - mount is backed by another workspace and should be used as redirect to another workspace.
@@ -158,6 +210,63 @@ metadata:
 spec:
    type: passthrough
 ```
+
+### Workspace & Mount status propagation
+
+When mounting workspace, there should be a way to propagate status to the workspace itself,
+so making sure that the workspace is not falsely marked as ready when the mount is not ready.
+
+When workspace mount is implemented by external objects:
+```go
+	// Reference is an ObjectReference to the object that is mounted.
+	Reference *corev1.ObjectReference `json:"ref,omitempty"`
+```
+
+We need a way to propagate status from the mount object to the workspace object.
+
+Suggestion is to create `kcp` core controller which would propagate any conditions
+from the mount object to the workspace object which starts with `Workspace*` prefix.
+
+if object, implementing object raises conditions:
+```yaml
+    conditions:
+    - lastTransitionTime: "2024-04-28T10:43:29Z"
+      status: "False"
+      type: ConnectorReady
+	- lastTransitionTime: "2024-04-28T10:43:29Z"
+	  status: "False"
+	  type: WorkspaceMountReady
+```
+it would be propagated to the workspace object as bellow, making workspace
+unavailable:
+```yaml
+  status:
+    conditions:
+    - lastTransitionTime: "2024-04-28T10:43:29Z"
+      status: "True"
+      type: MountReady
+    - lastTransitionTime: "2024-04-28T10:40:25Z"
+      status: "True"
+      type: WorkspaceScheduled
+	- lastTransitionTime: "2024-04-28T10:43:29Z"
+	  status: "False"
+	  type: MountReady
+    phase: Unavailable
+```
+
+Proposal is to make workspace conditions propagated as aggregate to workspace `phase`.
+
+Current flow: `Creating -> Initializing -> Ready` where once workspace is created and ready
+it is marked as ready and never updated.
+
+Proposed flow: `Creating -> Initializing -> Ready <-> Unavailable.` where if any of the conditions
+are not `Ready` the workspace is marked as `Unavailable`.
+
+This would be achieved my adding new controller into kcp core to reconcile workspace phase
+based on its own conditions.
+
+Existing mount controller would be responsible for propagating conditions from the mount object
+to the workspace object.
 
 #### Suggested action items
 
