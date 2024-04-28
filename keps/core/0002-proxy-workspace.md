@@ -236,9 +236,9 @@ If an object, implementing object raises conditions:
     - lastTransitionTime: "2024-04-28T10:43:29Z"
       status: "False"
       type: ConnectorReady
-	- lastTransitionTime: "2024-04-28T10:43:29Z"
-	  status: "False"
-	  type: WorkspaceMountReady
+    - lastTransitionTime: "2024-04-28T10:43:29Z"
+      status: "False"
+      type: WorkspaceMountReady
 ```
 it would be propagated to the workspace object as bellow, making workspace
 unavailable:
@@ -251,9 +251,9 @@ unavailable:
     - lastTransitionTime: "2024-04-28T10:40:25Z"
       status: "True"
       type: WorkspaceScheduled
-	- lastTransitionTime: "2024-04-28T10:43:29Z"
-	  status: "False"
-	  type: MountReady
+    - lastTransitionTime: "2024-04-28T10:43:29Z"
+      status: "False"
+      type: MountReady
     phase: Unavailable
 ```
 
