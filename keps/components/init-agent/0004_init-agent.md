@@ -19,7 +19,7 @@ On a high level, the agent allows a persona to define a list of APIs and APIObje
 * the agent can be run in a Kubernetes cluster alongside other workload
 * templating is supported before an object gets synched to the workspace
 * custom APIs are supported
-* allowing for workspace hierarchy creation is a plus, but not a must
+* allowing for workspace hierarchy
 
 ## High-Level Architecture
 
@@ -34,16 +34,21 @@ Initial setup (one time):
 1. Init-admin deploys the init-agent into their Kubernetes cluster and passes in the kubeconfigs from the previous steps. *Editor Note: Currently I think this is the only way to use the [initializingworkspaces multicluster-provider](https://github.com/kcp-dev/multicluster-provider), there does not seem to be any handling for sharding; So we should discuss whether we might want to build sharding into the multicluster provider before starting to write this controller*
 1. Init-admin configures at least one InitTarget (see CRDs below) and optionally InitTemplates in the init-agent backing workspace
 
-Operator in Action:
+Operator in Action (bootstrap mode):
 
 1. An end-user creates a workspace of the aforementioned WorkspaceType
 1. Init-agent gets a watch event, fetches its InitEvent and starts reconciling:
-    1. Init-agent adds all ResourceSchemas to an APIExport in init-agents backing workspace
-    1. Init-agent creates an ApiBinding mapping to the aforementioned APIExport and creates it in the newly created end-user workspace
-    1. Init-agent waits for all requested APIs to become ready
-    1. Init-agent creates any objects requested in the InitTarget and creates any missing namespaces
+    1. Init-agent fetches the InitTarget, goes through all the sources in order
+    1. Init-agent first looks for any CRDs in a source and copies them over to the target workspace and waits for APIs to be available
+    1. Init-agent looks for any APIBindings in a sources, copies them over and waits for APIs to be available
+    1. Init-agent parses all namespaces in a source and creates any missing namespaces
+    1. Init-agent creates any other requested objects
 1. Init-agent removes its initializer from the list
 1. (Assuming init-agents initializer was the last initializer): The end-user workspace gets marked as ready and is available to receive requests
+
+Operator in Action (lifecycle mode):
+
+1. In configurable intervals, the init-agent goes through its InitTargets and repeats the aforementioned reconciliation loop
 
 ## CRDs
 
@@ -80,11 +85,24 @@ spec:
     metadata:
       name: {{ .upstream.workspaceName }}-my-secret
     data:
-      password: {{ sprig.randAlphaNum(10) }}
+      info: "some super secret info"
 ```
+
+In the initial version of the agent, the following variables should be available:
+
+* WorkspaceName
+* LogicalClusterID
 
 ## Considered Downsides
 
 ### API CRD maintenance
 
 By design, InitTemplates abstract away the need to have the API available on the cluster in order to make full templating possible and skip any OpenAPISchema validation. Specifically, InitTemplates can be created in the backing workspace successfully, even if no API matching the object described in `.spec.text` exists. Additionally any object created downstream may be invalid. However given our current requirement of full-text templating, we don't see an elegant way to work around this. What is possible theoretically is that a webhook would deny any InitTemplates whose inferred APIs are not yet available. This should be considered separately of the main controller of this agent.
+
+### Randomness in templating
+
+We have considered to offer random string generation in templating. To make this work, we need a reliable mechanism to compare old and new versions of a manifest, that also accounts for randomness. We considered using an approach like helm, where the rendered version of a manifest is stored. However the big downside of this approach is that we would need to generate tons of shadow manifests, which will clog up the api-server and is not in line with the scaling ambitions of this project. Additionally we also considered an approach where we would try to identify random fields and skip them for comparison. However this is not possible, as templating also allows conditional statements (e.g. if statements), which in conjunction with randomness are tough to automatically render and compare to old versions.
+
+If at a later point in time we do want to support random string generation, we can consider adding it via seed freezing.
+
+As a result, The initial version of the templating will not support randomness (e.g. via random funcs or current time funcs).
