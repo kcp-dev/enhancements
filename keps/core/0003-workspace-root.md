@@ -3,18 +3,18 @@
 ## Summary
 
 Introduce a `WorkspaceRoot` API object to enable forest-type workspace hierarchies in kcp,
-allowing multiple independent workspace trees to coexist. This addresses security concerns
-with the current single-root structure where organizational hierarchy is exposed to all users,
-and provides better tenant isolation by giving each organization its own opaque root identifier.
+allowing multiple independent workspace trees to coexist. This addresses social engineering 
+security concerns with the current single-root structure where organizational hierarchy is exposed 
+to all users, and provides better tenant isolation by giving each organization its own opaque root identifier.
 
 Currently, users navigating kcp workspaces can infer organizational structure:
-```
+```text
 root:orgs:company-a:team1:project
 root:orgs:company-b:team2:project
 ```
 
 With WorkspaceRoot, each organization gets its own isolated tree with an opaque identifier:
-```
+```text
 a1b2c3d4:team1:project  # company-a's tree
 x9y8z7w6:team2:project  # company-b's tree
 ```
@@ -24,8 +24,7 @@ x9y8z7w6:team2:project  # company-b's tree
 ### Current State Problems
 
 1. **Hierarchy Exposure**: The current single-root structure (`root:orgs:...`) exposes the
-   organizational hierarchy to all users. Even without access, users can guess names, based
-   on naming conventions.
+   organizational hierarchy to all users.
 
 2. **Predictable Paths**: Organization names in workspace paths are predictable. Knowing one
    organization exists (e.g., `root:orgs:acme`) allows guessing siblings (`root:orgs:contoso`).
@@ -35,23 +34,12 @@ x9y8z7w6:team2:project  # company-b's tree
    that exposes implementation details to consumers. Organizations should not need to know they
    exist under a shared `root:orgs` prefix.
 
-4. **Navigation Leakage**: Users can walk up the hierarchy using `ws use ..` and discover
-   sibling workspaces, even if they receive permission denied errors. While this can be mitigated with rbac,
-   but its very easy to misconfigure and leave gaps.
-   ```bash
-   $ kubectl ws use :root:orgs:bob
-   Error: the server has asked for the client to provide credentials  # 401 - exists!
-
-   $ kubectl ws use :root:orgs:bob1
-   Error: access to workspace "root:orgs:bob1" denied  # 403 - doesn't exist
-   ```
-
 ### Goals
 
 1. Enable creation of independent workspace trees (forest structure) with opaque root identifiers.
 2. Provide tenant isolation where organizations cannot infer existence of sibling organizations.
 3. Maintain compatibility with existing workspace hierarchy mechanics within each tree.
-4. Support WorkspaceType inheritance and WorkspaceAuthenticationConfiguration within trees.
+4. Support WorkspaceType inheritance and WorkspaceAuthenticationConfiguration across trees.
 5. Keep the API simple and focused on tree orchestration.
 
 ### Non-Goals
@@ -82,10 +70,10 @@ type WorkspaceRoot struct {
 }
 
 type WorkspaceRootSpec struct {
-    // Name is the optional human-readable name for this root.
-    // If not provided, a random base36 identifier will be generated.
-    // +optional
-    Name string `json:"name,omitempty"`
+    // PrettyName is an optional human-friendly name for the workspace root.
+	// This is not used for access or API paths, but can be displayed in UIs and logs. 
+	// +optional
+    PrettyName string `json:"prettyName,omitempty"`
 
     // Type references a WorkspaceType that defines the initial configuration
     // for the root workspace, including allowed child types.
@@ -195,7 +183,7 @@ The WorkspaceRoot controller is responsible for:
 3. **Initialization**: Applying WorkspaceType configuration if specified.
 4. **Lifecycle Management**: Handling deletion with proper cleanup.
 
-```
+```text
 WorkspaceRoot Created
         │
         ▼
@@ -242,8 +230,8 @@ natural RBAC scoping.
 
 - **User-provided names**: If `spec.name` is provided, it's used as metadata but
   the root path is still a generated opaque identifier.
-- **Generated identifiers**: Base36 encoded, providing sufficient entropy to
-  prevent guessing (e.g., `a1b2c3d4`, `x9y8z7w6`).
+- **Optionallu Generated identifiers**: If name is not provided, GeneratedName function can
+  be used to create random names.
 - **Root workspace**: The system `root` workspace continues to exist for system
   resources but organizations get their own trees.
 
