@@ -1,11 +1,11 @@
-# Workspace Root (Forest Support)
+# Logical Root (Forest Support)
 
 ## Summary
 
-Introduce a `WorkspaceRoot` API object to enable forest-type workspace hierarchies in kcp,
-allowing multiple independent workspace trees to coexist. This addresses social engineering 
-security concerns with the current single-root structure where organizational hierarchy is exposed 
-to all users, and provides better tenant isolation by giving each organization its own opaque root identifier.
+Introduce a `LogicalRoot` API object to enable forest-type workspace hierarchies in kcp,
+allowing multiple independent workspace trees to coexist. This addresses social engineering
+security concerns with the current single-root structure where organizational hierarchy is exposed
+to all users, and provides better tenant isolation by giving each organization its own root identifier.
 
 Currently, users navigating kcp workspaces can infer organizational structure:
 ```text
@@ -13,7 +13,7 @@ root:orgs:company-a:team1:project
 root:orgs:company-b:team2:project
 ```
 
-With WorkspaceRoot, each organization gets its own isolated tree with an opaque identifier:
+With LogicalRoot, each organization gets its own isolated tree with its own identifier:
 ```text
 a1b2c3d4:team1:project  # company-a's tree
 x9y8z7w6:team2:project  # company-b's tree
@@ -36,44 +36,46 @@ x9y8z7w6:team2:project  # company-b's tree
 
 ### Goals
 
-1. Enable creation of independent workspace trees (forest structure) with opaque root identifiers.
+1. Enable creation of independent workspace trees (forest structure) with their own root identifiers.
 2. Provide tenant isolation where organizations cannot infer existence of sibling organizations.
 3. Maintain compatibility with existing workspace hierarchy mechanics within each tree.
-4. Support WorkspaceType inheritance and WorkspaceAuthenticationConfiguration across trees.
+4. Support WorkspaceType inheritance and WorkspaceAuthenticationConfiguration across trees (WorkspaceType
+   already supports path references, so cross-tree type references are supported).
 5. Keep the API simple and focused on tree orchestration.
 
 ### Non-Goals
 
 1. Advanced scheduling across shards (basic scheduling only).
 2. Replacing the existing workspace hierarchy model - this extends it.
-3. Cross-tree workspace references or mounts (each tree is isolated). This is out of scope for this KEP but 
-   technically possible in the future if needed.
+3. Cross-tree workspace mounts. Workspaces cannot mount workspaces from other trees. However,
+   APIBindings across trees are explicitly supported (e.g., a workspace in tree `a1b2c3d4` can
+   bind to APIs exported from `root`).
 4. Automatic migration of existing workspaces to new trees.
 5. Facade/translation layer - these are real separate roots, not path rewriting.
 
 ## Proposal
 
-### WorkspaceRoot API
+### LogicalRoot API
 
-Introduce a new API object `WorkspaceRoot` in the `tenancy.kcp.io` API group:
+Introduce a new API object `LogicalRoot` in the `forest.tenancy.kcp.io` API group:
 
 ```go
-// WorkspaceRoot defines an independent workspace tree root.
-// Creating a WorkspaceRoot provisions a new LogicalCluster that serves
+// LogicalRoot defines an independent workspace tree root.
+// Creating a LogicalRoot provisions a new LogicalCluster that serves
 // as the root of an isolated workspace hierarchy.
-type WorkspaceRoot struct {
+type LogicalRoot struct {
     metav1.TypeMeta   `json:",inline"`
     metav1.ObjectMeta `json:"metadata,omitempty"`
 
-    Spec   WorkspaceRootSpec   `json:"spec,omitempty"`
-    Status WorkspaceRootStatus `json:"status,omitempty"`
+    Spec   LogicalRootSpec   `json:"spec,omitempty"`
+    Status LogicalRootStatus `json:"status,omitempty"`
 }
 
-type WorkspaceRootSpec struct {
-    // PrettyName is an optional human-friendly name for the workspace root.
-	// This is not used for access or API paths, but can be displayed in UIs and logs. 
-	// +optional
-    PrettyName string `json:"prettyName,omitempty"`
+type LogicalRootSpec struct {
+    // Cluster is an optional name for the logical cluster path.
+    // If not provided, a random base36 identifier will be generated.
+    // +optional
+    Cluster string `json:"cluster,omitempty"`
 
     // Type references a WorkspaceType that defines the initial configuration
     // for the root workspace, including allowed child types.
@@ -81,21 +83,24 @@ type WorkspaceRootSpec struct {
     Type *WorkspaceTypeReference `json:"type,omitempty"`
 }
 
-type WorkspaceRootStatus struct {
-    // Phase indicates the current state of the workspace root.
+type LogicalRootStatus struct {
+    // Phase indicates the current state of the logical root.
     // +kubebuilder:default=Scheduling
-    Phase WorkspaceRootPhase `json:"phase,omitempty"`
+    Phase LogicalRootPhase `json:"phase,omitempty"`
 
     // RootPath is the path identifier for this workspace tree root.
-    // This is the opaque identifier users will use to access this tree.
+    // This is the identifier users will use to access this tree.
     // Example: "a1b2c3d4" rather than "root:orgs:company-a"
     RootPath string `json:"rootPath,omitempty"`
 
-    // URL is the base URL for accessing workspaces in this tree.
+    // URL is the base URL for accessing workspaces in this tree via the front-proxy.
+    // Format: https://<front-proxy>/clusters/<rootPath>
+    // This is set by the provisioning controller based on the front-proxy configuration.
+    // Note: All front-proxies in a kcp deployment must share the same external URL.
     // +optional
     URL string `json:"url,omitempty"`
 
-    // Conditions represent the current state of the workspace root.
+    // Conditions represent the current state of the logical root.
     // +optional
     Conditions conditionsv1alpha1.Conditions `json:"conditions,omitempty"`
 
@@ -104,13 +109,13 @@ type WorkspaceRootStatus struct {
     LogicalCluster string `json:"logicalCluster,omitempty"`
 }
 
-type WorkspaceRootPhase string
+type LogicalRootPhase string
 
 const (
-    WorkspaceRootPhaseScheduling   WorkspaceRootPhase = "Scheduling"
-    WorkspaceRootPhaseInitializing WorkspaceRootPhase = "Initializing"
-    WorkspaceRootPhaseReady        WorkspaceRootPhase = "Ready"
-    WorkspaceRootPhaseDeleting     WorkspaceRootPhase = "Deleting"
+    LogicalRootPhaseScheduling   LogicalRootPhase = "Scheduling"
+    LogicalRootPhaseInitializing LogicalRootPhase = "Initializing"
+    LogicalRootPhaseReady        LogicalRootPhase = "Ready"
+    LogicalRootPhaseDeleting     LogicalRootPhase = "Deleting"
 )
 ```
 
@@ -121,10 +126,10 @@ const (
 │                         kcp cluster                             │
 ├─────────────────────────────────────────────────────────────────┤
 │  root (system workspace)                                        │
-│  ├── orgs:workspaceroots (stores WorkspaceRoot objects)         │
-│  │   ├── WorkspaceRoot/company-a → provisions "a1b2c3d4"        │
-│  │   ├── WorkspaceRoot/company-b → provisions "x9y8z7w6"        │
-│  │   └── WorkspaceRoot/company-c → provisions "m5n6o7p8"        │
+│  ├── orgs (stores LogicalRoot objects)                          │
+│  │   ├── LogicalRoot/company-a → provisions "a1b2c3d4"          │
+│  │   ├── LogicalRoot/company-b → provisions "x9y8z7w6"          │
+│  │   └── LogicalRoot/company-c → provisions "m5n6o7p8"          │
 │  └── ...                                                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  a1b2c3d4 (company-a's root)     ← independent tree             │
@@ -176,7 +181,7 @@ clusters:
 
 ### Controller Behavior
 
-The WorkspaceRoot controller is responsible for:
+The LogicalRoot controller is responsible for:
 
 1. **Scheduling**: Selecting a shard for the new root LogicalCluster.
 2. **Provisioning**: Creating the LogicalCluster with a unique base36 identifier.
@@ -184,7 +189,7 @@ The WorkspaceRoot controller is responsible for:
 4. **Lifecycle Management**: Handling deletion with proper cleanup.
 
 ```text
-WorkspaceRoot Created
+LogicalRoot Created
         │
         ▼
 ┌───────────────┐
@@ -204,55 +209,89 @@ WorkspaceRoot Created
 
 ### Deletion Behavior
 
-When a WorkspaceRoot is deleted:
+When a LogicalRoot is deleted:
 
 1. A finalizer prevents immediate deletion.
 2. All child workspaces within the tree are deleted recursively.
 3. The root LogicalCluster is deleted.
-4. The finalizer is removed and the WorkspaceRoot object is deleted.
+4. The finalizer is removed and the LogicalRoot object is deleted.
 
 This cascading deletion is guarded by finalizers on child workspaces to ensure
 proper cleanup order.
 
 ### API Location and RBAC
 
-The WorkspaceRoot API is made available through APIExport/APIBinding:
+The LogicalRoot API is made available through APIExport/APIBinding:
 
-1. The `tenancy` APIExport in root workspace includes WorkspaceRoot.
-2. Administrators bind the tenancy API to workspaces where they want to allow
+1. The `forest.tenancy.kcp.io` APIExport in root workspace includes LogicalRoot.
+2. Administrators bind the forest API to workspaces where they want to allow
    tree creation.
-3. No binding = no permission to create WorkspaceRoots.
+3. No binding = no permission to create LogicalRoots.
 
 This follows the existing pattern for Workspace API availability and provides
 natural RBAC scoping.
 
 ### Naming and Identifiers
 
-- **User-provided names**: If `spec.name` is provided, it's used as metadata but
-  the root path is still a generated opaque identifier.
-- **Optionallu Generated identifiers**: If name is not provided, GeneratedName function can
-  be used to create random names.
-- **Root workspace**: The system `root` workspace continues to exist for system
-  resources but organizations get their own trees.
+The naming strategy for workspace roots is controlled by feature gates to support different
+deployment scenarios:
+
+#### Feature Gate: `LogicalRootRandomNames` (default: enabled)
+
+When enabled, the root path identifier is always randomly generated (base36), regardless of
+the `metadata.name` of the LogicalRoot object. This prevents:
+- Different shards from claiming the same prefix
+- Predictable/guessable root identifiers
+- Collisions when multiple controllers provision roots concurrently
+
+Example:
+```yaml
+apiVersion: forest.tenancy.kcp.io/v1alpha1
+kind: LogicalRoot
+metadata:
+  name: company-a          # Object name for management
+spec:
+  cluster: ""              # Empty = randomly generated. Not allowed to specify when random names enabled.
+status:
+  rootPath: a1b2c3d4       # Randomly generated, used for access
+```
+
+#### Feature Gate: `LogicalRootDeterministicNames` (default: disabled)
+
+When enabled (and `LogicalRootRandomNames` disabled), the root path is derived from
+`metadata.name`. This is useful for deployments where:
+- Predictable paths are required for automation
+- A single controller manages all root provisioning
+- Human-readable paths are preferred over security-by-obscurity
+
+**Note**: These two feature gates are mutually exclusive and cannot be mixed on the same
+kcp instance.
+
+#### Other Naming Considerations
+
+- **Cluster**: The `spec.cluster` field specifies the desired logical cluster path. If empty,
+  a random base36 identifier is generated (when `LogicalRootRandomNames` is enabled).
+- **Root workspace**: The system `root` workspace continues to exist for system resources.
+  Organizations get their own independent trees.
 
 ## Implementation Phases
 
 ### Phase 1: Core API and Controller
 
-1. Define WorkspaceRoot CRD in `tenancy.kcp.io/v1alpha1`.
+1. Define LogicalRoot CRD in `forest.tenancy.kcp.io/v1alpha1`.
 2. Implement basic controller for lifecycle management.
 3. Basic scheduling (single shard initially).
 4. Integration with existing LogicalCluster provisioning.
 
 ### Phase 2: WorkspaceType Integration
 
-1. Support WorkspaceType reference in WorkspaceRoot spec.
+1. Support WorkspaceType reference in LogicalRoot spec.
 2. Apply type configuration to root workspace.
 3. Inherit WorkspaceAuthenticationConfiguration.
 
 ### Phase 3: Multi-Shard Support
 
-1. Shard selection for WorkspaceRoot placement.
+1. Shard selection for LogicalRoot placement.
 2. Cross-shard tree management.
 
 ## Alternatives Considered
