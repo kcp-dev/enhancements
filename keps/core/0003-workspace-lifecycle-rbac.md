@@ -421,6 +421,72 @@ For workspaces created before this enhancement:
   `logicalcluster_reconcile_metadata.go:99-117` should be removed. With owner identity moving
   to an immutable spec field, there is no longer a reason to strip data from the annotation.
 
+## Breaking Changes
+
+This enhancement introduces a **breaking change** in the authorization model for virtual
+workspace content access.
+
+### Before
+
+Any controller with the `initialize` verb on a `workspacetypes` resource could access
+workspace content through the initializing virtual workspace content proxy. The `initialize`
+verb served as a single gate for both LogicalCluster VW endpoints (list/watch/status) and
+workspace content (creating namespaces, configmaps, etc. inside the workspace). There was no
+separate authorization step for content access — it was implicitly granted.
+
+### After
+
+Content access through the virtual workspace content proxy now requires the **`impersonate`**
+verb on the `workspacetypes` resource **in addition to** `initialize` or `terminate`.
+
+- `initialize` or `terminate` alone → access to LogicalCluster VW endpoints only
+- `initialize` + `impersonate` → access to LogicalCluster VW endpoints **and** workspace content
+- `terminate` + `impersonate` → access to LogicalCluster VW endpoints **and** workspace content
+
+### Impact
+
+**Existing initializer controllers that access workspace content will break** unless their
+ClusterRoles are updated to include the `impersonate` verb. Controllers that only list/watch
+LogicalClusters and update their status (i.e., do not access workspace content) are unaffected.
+
+**Required migration**: For any ClusterRole that grants `initialize` or `terminate` on
+`workspacetypes` and whose controller accesses workspace content through the VW proxy, add
+`impersonate` to the verbs:
+
+```yaml
+# Before
+rules:
+  - verbs: ["initialize"]
+    resources: ["workspacetypes"]
+    resourceNames: ["my-type"]
+    apiGroups: ["tenancy.kcp.io"]
+
+# After
+rules:
+  - verbs: ["initialize", "impersonate"]
+    resources: ["workspacetypes"]
+    resourceNames: ["my-type"]
+    apiGroups: ["tenancy.kcp.io"]
+```
+
+The same applies to `terminate`:
+
+```yaml
+# Before
+rules:
+  - verbs: ["terminate"]
+    resources: ["workspacetypes"]
+    resourceNames: ["my-type"]
+    apiGroups: ["tenancy.kcp.io"]
+
+# After
+rules:
+  - verbs: ["terminate", "impersonate"]
+    resources: ["workspacetypes"]
+    resourceNames: ["my-type"]
+    apiGroups: ["tenancy.kcp.io"]
+```
+
 ## Open Questions
 
 1. **Should `impersonate` without `initialize`/`terminate` be meaningful?**
