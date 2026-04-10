@@ -36,23 +36,32 @@ The current workspace lifecycle has several gaps (see also
 5. **Misleading audit logs.** The content proxy impersonates the workspace owner identity.
    Audit logs cannot distinguish whether a request came from the actual owner or a controller
    impersonating them. With multiple initializers/terminators, controllers are
-   indistinguishable from each other and from the owner.
+   indistinguishable from each other and from the owner. Clear attribution is a first-class
+   goal of this proposal.
 
 6. **No `Terminating` phase.** Workspaces that are being terminated show as `Ready` in
    `kubectl get workspaces`. There is no way to tell which workspaces are stuck in termination
    without inspecting deletion timestamps and terminator lists.
+
+All initializing/terminating VW requests continue to be routed through the FrontProxy (not
+directly to shards), as today. This is unchanged by this proposal — the VW machinery is a
+replicated, front-proxy-served concern by design.
 
 ### Goals
 
 1. Move workspace owner identity from annotation to a structured, immutable field on
    `LogicalCluster`.
 2. Introduce fine-grained, declarative RBAC for workspace content access during initialization
-   and termination, defined on `WorkspaceType`. Controllers access content with their own
+   and termination, defined on `WorkspaceType`. Granularity matches standard Kubernetes RBAC
+   (apiGroups / resources / verbs / resourceNames). Controllers access content with their own
    identity, scoped to explicitly declared permissions.
-3. Add a workspace content proxy to the terminating virtual workspace, matching the capability
+3. Clear audit attribution: initializer/terminator requests carry the controller's own
+   identity, not the workspace owner's, so audit logs unambiguously identify which controller
+   acted.
+4. Add a workspace content proxy to the terminating virtual workspace, matching the capability
    that already exists for the initializing virtual workspace.
-4. Add a `Terminating` phase for workspace visibility.
-5. Preserve backwards compatibility: WorkspaceTypes without explicit permissions fall back to
+5. Add a `Terminating` phase for workspace visibility.
+6. Preserve backwards compatibility: WorkspaceTypes without explicit permissions fall back to
    owner impersonation (current behavior).
 
 ### Non-Goals
@@ -61,10 +70,8 @@ The current workspace lifecycle has several gaps (see also
 - Changing direct workspace access patterns. The workspace content authorizer continues to
   handle direct access; the VW proxies handle lifecycle content access.
 - Per-controller custom impersonation identity selection.
-- Preventing users from deleting the auto-created initializer/terminator ClusterRoles and
-  ClusterRoleBindings inside the workspace. A user with sufficient RBAC could delete these
-  objects, which would break initializer/terminator content access. Protecting these objects
-  (e.g., via admission webhook or finalizers) is out of scope for now.
+- Per-workspace (instance-level) overrides of initializer/terminator permissions. Permissions
+  are declared once on the WorkspaceType and apply uniformly to all workspaces of that type.
 
 ## Proposal
 
@@ -121,11 +128,10 @@ type ExtraValue []string
 
 | Component | File | Change |
 |---|---|---|
-| Workspace admission | `pkg/admission/workspace/admission.go` | On workspace creation, set `ownerUser` on the Workspace (to be propagated to LogicalCluster) in addition to the existing annotation |
+| Workspace admission | `pkg/admission/workspace/admission.go` | On workspace creation, set `ownerUser` on the Workspace (to be propagated to LogicalCluster); stop setting the `experimental.tenancy.kcp.io/owner` annotation |
 | LogicalCluster admission | `pkg/admission/logicalcluster/admission.go` | Validate that `spec.ownerUser` is immutable after creation |
-| LogicalCluster controller | `pkg/reconciler/tenancy/logicalcluster/logicalcluster_controller.go` | Read owner from `spec.ownerUser` instead of annotation when creating `workspace-admin` CRB |
+| LogicalCluster controller | `pkg/reconciler/tenancy/logicalcluster/logicalcluster_controller.go` | Read owner from `spec.ownerUser` when creating `workspace-admin` CRB |
 | Metadata reconciler | `pkg/reconciler/core/logicalcluster/logicalcluster_reconcile_metadata.go` | Remove group-wiping logic and annotation handling entirely |
-| Workspace admission | `pkg/admission/workspace/admission.go` | Stop setting the `experimental.tenancy.kcp.io/owner` annotation |
 | Initializing VW content proxy | `pkg/virtual/initializingworkspaces/builder/build.go` | Read from `spec.ownerUser` only; remove annotation fallback |
 
 The `experimental.tenancy.kcp.io/owner` annotation is removed entirely in this change.
@@ -217,22 +223,43 @@ explicit permissions:
 
 When `initializerPermissions` or `terminatorPermissions` is set on the WorkspaceType:
 
-1. kcp automatically creates a ClusterRole and ClusterRoleBinding inside the workspace
-   (see "Automatic RBAC Creation" below).
-2. The VW proxy injects a synthetic group into the request context instead of impersonating
-   the owner.
-3. The request reaches the workspace with the **controller's own identity** plus the
-   synthetic group.
-4. RBAC inside the workspace evaluates the synthetic group against the auto-created
-   ClusterRole.
+1. The VW proxy evaluates the incoming request **in-process** against the WorkspaceType's
+   `initializerPermissions` / `terminatorPermissions` rules (verb / apiGroup / resource /
+   resourceName match) using the standard RBAC evaluation logic. This happens after the
+   existing `initialize`/`terminate` verb check and phase/presence validation.
+2. If the request is denied, the VW proxy returns 403 without ever forwarding to the shard.
+3. If allowed, the VW proxy forwards to the shard with the **controller's own identity**
+   plus a synthetic group (see "Synthetic Groups" below).
+4. On the shard side, the workspace content authorizer recognizes the synthetic group as a
+   "pre-authorized by VW" signal and allows the request. It does **not** re-evaluate the
+   WorkspaceType rules — the VW has already done that. This is a trivial trust check, not a
+   full authorizer.
 5. Audit logs show the controller's actual identity — clear attribution.
+
+This keeps the expensive work (rule evaluation) on the lifecycle path only: the VW proxy
+is the single place that knows about `initializerPermissions` / `terminatorPermissions`.
+The normal workspace authorization chain is **not** modified to evaluate these rules — it
+only needs to recognize and trust the synthetic group when set, and reject it when not.
+
+This is deliberately "magic/ephemeral" rather than "visible" RBAC: the rules live on the
+WorkspaceType (the source of truth) and are evaluated by the VW proxy on each request.
+This avoids:
+
+- Running lifecycle permission logic for every workspace request — only VW-bound requests
+  pay the cost.
+- Lifecycle permissions accidentally applying outside init/term phases — the VW proxy is
+  the only entry point that knows about these rules; direct shard requests cannot benefit.
+- Race conditions at workspace creation ("is the CRB there yet when the controller hits the
+  API?") — nothing needs to be created in the workspace before the controller can act.
+- Users accidentally or deliberately deleting the CRB and breaking lifecycle access.
+- Drift between WorkspaceType rules and materialized objects.
+- Finalizers/cleanup machinery for CRBs that get left behind after initialization.
 
 **Mode 2: Owner impersonation (fallback, backwards compatible)**
 
 When `initializerPermissions` or `terminatorPermissions` is empty/nil:
 
-1. The VW proxy impersonates the workspace owner from `spec.ownerUser` (or annotation
-   fallback).
+1. The VW proxy impersonates the workspace owner from `spec.ownerUser`.
 2. The request reaches the workspace as the owner, who has cluster-admin via the
    `workspace-admin` ClusterRoleBinding.
 3. This is the current behavior — no changes needed for existing controllers.
@@ -250,70 +277,55 @@ workspace path and the type name (e.g., `root:org:tenant`). This is already glob
 two WorkspaceTypes with the same name in different workspaces produce different identifiers.
 No clash is possible.
 
-These groups are only added by the VW proxy — they cannot be self-asserted by clients.
+These groups are only added by the VW proxy — they cannot be self-asserted by clients. As
+a defense-in-depth measure, the workspace content authorizer strips any `system:kcp:initializer:*`
+/ `system:kcp:terminator:*` groups from incoming requests that did not come through the VW
+proxy (i.e., direct requests to the shard).
 
-#### Automatic RBAC Creation
+#### Ephemeral (in-memory) RBAC Evaluation
 
-When a WorkspaceType has explicit permissions, kcp creates RBAC inside the workspace
-automatically. This happens in the LogicalCluster controller (same place that creates
-`workspace-admin` CRB).
+When a WorkspaceType has explicit `initializerPermissions` / `terminatorPermissions`, kcp
+does **not** create any ClusterRole or ClusterRoleBinding objects inside the workspace.
+Instead, the VW proxy evaluates the request in-process against the WorkspaceType spec
+before forwarding to the shard.
 
-For initializers (on workspace creation, before VW discovery):
-
-```yaml
-# Auto-created by kcp inside the workspace
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: system:kcp:initializer:<initializer-name>
-rules:
-  # Copied from WorkspaceType.spec.initializerPermissions
-  - apiGroups: [""]
-    resources: ["configmaps", "secrets", "namespaces"]
-    verbs: ["get", "list", "create", "update", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:kcp:initializer:<initializer-name>
-roleRef:
-  kind: ClusterRole
-  name: system:kcp:initializer:<initializer-name>
-subjects:
-  - kind: Group
-    name: system:kcp:initializer:<initializer-name>
-```
-
-For terminators (on workspace deletion, before terminating VW discovery):
+Conceptually the evaluation is equivalent to what RBAC would do if the following objects
+existed — but they do **not** exist as API objects, they are evaluated in memory from the
+WorkspaceType spec at request time:
 
 ```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: system:kcp:terminator:<terminator-name>
-rules:
-  # Copied from WorkspaceType.spec.terminatorPermissions
-  - apiGroups: [""]
-    resources: ["*"]
-    verbs: ["get", "list", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:kcp:terminator:<terminator-name>
-roleRef:
-  kind: ClusterRole
-  name: system:kcp:terminator:<terminator-name>
-subjects:
-  - kind: Group
-    name: system:kcp:terminator:<terminator-name>
+# Virtual, in-memory only — NOT a real object in the workspace
+ClusterRole: system:kcp:initializer:<initializer-name>
+  rules: <from WorkspaceType.spec.initializerPermissions>
+ClusterRoleBinding: system:kcp:initializer:<initializer-name>
+  roleRef: system:kcp:initializer:<initializer-name>
+  subjects:
+    - kind: Group
+      name: system:kcp:initializer:<initializer-name>
 ```
+
+The VW proxy's evaluator:
+
+1. Resolves the WorkspaceType for the current workspace (via `LogicalCluster.spec.type` /
+   cached WorkspaceType informer).
+2. Evaluates the request's verb / apiGroup / resource / resourceName against the matching
+   `initializerPermissions` or `terminatorPermissions` rules using standard RBAC matching
+   semantics.
+3. Allows → forward to shard with controller identity + synthetic group.
+   Denies → return 403 immediately.
+
+Because rules live on the WorkspaceType and are evaluated on the fly, permission changes on
+the WorkspaceType take effect immediately for all workspaces of that type. There is no
+snapshot, no drift, no materialized state to reconcile. See the "Permission updates" note
+in Open Questions for the policy trade-off.
 
 #### Extending Workspace Types
 
 When `gamma` extends `alpha` and `beta`, each initializer/terminator is independent. A
-workspace of type `gamma` gets three separate sets of RBAC — one for each initializer's
-synthetic group with that initializer's permissions from its own WorkspaceType. No merging.
+workspace of type `gamma` is evaluated against three separate sets of rules — one per
+initializer's synthetic group, using that initializer's permissions from its own
+WorkspaceType. No merging. The authorizer looks up permissions from the WorkspaceType that
+**owns** the synthetic group, not from the workspace's own type.
 
 #### Content Proxy Authorization Flow
 
@@ -330,8 +342,16 @@ synthetic group with that initializer's permissions from its own WorkspaceType. 
    → OK: proceed
 
 4. VW checks WorkspaceType for explicit permissions
-   → initializerPermissions set: inject synthetic group, forward with controller identity
+   → initializerPermissions set:
+       a. Evaluate request in-process against initializerPermissions rules
+          - Denied: return 403 immediately, do not forward
+          - Allowed: forward to shard with controller identity + synthetic group
    → initializerPermissions empty: impersonate workspace owner (fallback)
+
+5. Shard receives forwarded request
+   → Workspace content authorizer sees synthetic group system:kcp:initializer:<name>:
+     allow (trust: VW has already authorized; only VW can inject this group)
+   → No WorkspaceType rule evaluation on the shard
 ```
 
 The same flow applies to the terminating virtual workspace, substituting `terminate` for
@@ -343,18 +363,29 @@ The workspace content authorizer (`pkg/authorization/workspace_content_authorize
 currently allows access only for `Initializing` and `Ready` phases. Changes needed:
 
 - Allow access for the `Terminating` phase (see Part 4).
-- Recognize synthetic groups (`system:kcp:initializer:*`, `system:kcp:terminator:*`) —
-  these bypass the phase gate since the VW proxy has already validated phase/presence.
+- Recognize synthetic groups (`system:kcp:initializer:*`, `system:kcp:terminator:*`) as a
+  "pre-authorized by VW" marker and allow the request. This is a trivial trust check — the
+  shard does not evaluate WorkspaceType rules, it delegates that entirely to the VW proxy.
+- Strip any `system:kcp:initializer:*` / `system:kcp:terminator:*` groups from requests that
+  did not arrive via the VW proxy (i.e. cannot be attributed to the front-proxy → VW path),
+  so clients cannot self-assert these groups by talking to a shard directly.
+
+No new authorizer is added to the workspace authorization chain. The heavy lifting of
+lifecycle permission evaluation is confined to the VW proxy, which means:
+
+- Normal (non-lifecycle) workspace requests are unaffected — no extra work per request.
+- Lifecycle permissions only apply to requests arriving via the VW proxy, which only
+  accepts them during `Initializing` / `Terminating` phases with a matching entry in
+  `status.initializers` / `status.terminators`. Access cannot leak outside those phases.
 
 #### Implementation Changes
 
 | Component | File | Change |
 |---|---|---|
 | WorkspaceType API | SDK `apis/tenancy/v1alpha1/types_workspacetype.go` | Add `InitializerPermissions` and `TerminatorPermissions` fields |
-| LogicalCluster controller | `pkg/reconciler/tenancy/logicalcluster/logicalcluster_controller.go` | Create initializer/terminator ClusterRole + CRB from WorkspaceType permissions |
-| Initializing VW content proxy | `pkg/virtual/initializingworkspaces/builder/build.go` | Two modes: synthetic group injection (explicit perms) or owner impersonation (fallback) |
-| Terminating VW content proxy | `pkg/virtual/terminatingworkspaces/builder/build.go` | Same two-mode logic |
-| Workspace content authorizer | `pkg/authorization/workspace_content_authorizer.go` | Allow `Terminating` phase; recognize synthetic groups |
+| Initializing VW content proxy | `pkg/virtual/initializingworkspaces/builder/build.go` | Two modes: in-process RBAC evaluation against `initializerPermissions` then forward with synthetic group (explicit perms), or owner impersonation (fallback) |
+| Terminating VW content proxy | `pkg/virtual/terminatingworkspaces/builder/build.go` | Same two-mode logic for `terminatorPermissions` |
+| Workspace content authorizer | `pkg/authorization/workspace_content_authorizer.go` | Allow `Terminating` phase; trust synthetic groups as pre-authorized; strip synthetic groups from non-VW requests |
 
 ### Part 3: Terminating Virtual Workspace Content Proxy
 
@@ -485,11 +516,13 @@ Phase 2: Terminating Phase and Content Proxy
   - Content proxy uses owner impersonation (same as initializing VW)
   - Add e2e tests for terminator content access
 
-Phase 3: Declarative RBAC on WorkspaceType
+Phase 3: Declarative RBAC on WorkspaceType (ephemeral)
   - Add initializerPermissions/terminatorPermissions to WorkspaceTypeSpec
-  - Implement automatic ClusterRole/CRB creation in LogicalCluster controller
-  - Implement synthetic group injection in VW content proxies
-  - Update workspace content authorizer to recognize synthetic groups
+  - Implement in-process RBAC evaluation in the initializing/terminating VW content
+    proxies (evaluate request against WorkspaceType permissions before forwarding)
+  - Implement synthetic group injection when forwarding
+  - Update workspace content authorizer to trust synthetic groups as pre-authorized
+    and strip them from non-VW requests
   - Fallback to owner impersonation when permissions are empty
   - Add e2e tests for fine-grained permissions
 ```
@@ -529,17 +562,11 @@ authors opt into fine-grained permissions.
    `terminatorPermissions` only reference API groups and resources that are available in the
    workspace? Or allow any rules and let RBAC evaluation handle mismatches?
 
-3. **RBAC cleanup.** For **terminating** workspaces, cleanup is not needed — once all
-   terminators are removed, the workspace is deleted along with everything inside it. For
-   **initializing** workspaces, when an initializer removes itself and the workspace
-   transitions to `Ready`, the auto-created ClusterRole/CRB is left behind but harmless —
-   the synthetic group is only injected by the VW proxy during initialization, so the rules
-   grant nothing to anyone in the `Ready` phase. Proactive cleanup is possible but not
-   required for correctness or security.
-
-4. **Permission updates.** The WorkspaceType already has a lifecycle precedent:
-   `defaultAPIBindingLifecycle` supports `InitializeOnly` (snapshot at creation) and
-   `Maintain` (continuously reconciled). For `initializerPermissions`/`terminatorPermissions`,
-   we use `InitializeOnly` semantics: permissions are copied into the workspace at creation
-   time and changes to the WorkspaceType do not affect existing workspaces. A `Maintain`
-   mode could be added later if needed, following the same pattern.
+2. **Permission updates — semantics of ephemeral evaluation.** Because rules are evaluated
+   live from the WorkspaceType, edits to the WorkspaceType take effect **immediately** for
+   all existing workspaces of that type. This differs from the `defaultAPIBindingLifecycle`
+   `InitializeOnly` vs `Maintain` split, which only matters for materialized state. With
+   ephemeral RBAC, there is no materialized state to snapshot — the WorkspaceType **is** the
+   state. This is intentional: one source of truth, no drift, no reconciler. Operators must
+   be aware that tightening permissions on a WorkspaceType is an immediate change for every
+   workspace of that type.
