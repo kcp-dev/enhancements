@@ -277,10 +277,15 @@ workspace path and the type name (e.g., `root:org:tenant`). This is already glob
 two WorkspaceTypes with the same name in different workspaces produce different identifiers.
 No clash is possible.
 
-These groups are only added by the VW proxy — they cannot be self-asserted by clients. As
-a defense-in-depth measure, the workspace content authorizer strips any `system:kcp:initializer:*`
-/ `system:kcp:terminator:*` groups from incoming requests that did not come through the VW
-proxy (i.e., direct requests to the shard).
+These groups are only added by the VW proxy — they cannot be self-asserted by clients.
+This is enforced by the front-proxy's existing group filtering mechanism: the
+`--authentication-drop-groups` default list is extended to include `system:kcp:initializer:*`
+and `system:kcp:terminator:*`. This strips these groups from **all** client-asserted requests
+entering the front-proxy, before any routing occurs. The VW proxy (which runs inside the
+front-proxy process) then adds the synthetic groups **after** auth filtering when constructing
+the forwarded request to the shard. This is the same pattern used for
+`system:kcp:logical-cluster-admin` today — dropped at the front-proxy gate, injected only
+by trusted internal code paths.
 
 #### Ephemeral (in-memory) RBAC Evaluation
 
@@ -366,9 +371,9 @@ currently allows access only for `Initializing` and `Ready` phases. Changes need
 - Recognize synthetic groups (`system:kcp:initializer:*`, `system:kcp:terminator:*`) as a
   "pre-authorized by VW" marker and allow the request. This is a trivial trust check — the
   shard does not evaluate WorkspaceType rules, it delegates that entirely to the VW proxy.
-- Strip any `system:kcp:initializer:*` / `system:kcp:terminator:*` groups from requests that
-  did not arrive via the VW proxy (i.e. cannot be attributed to the front-proxy → VW path),
-  so clients cannot self-assert these groups by talking to a shard directly.
+  Synthetic groups cannot be self-asserted by clients because the front-proxy's
+  `--authentication-drop-groups` strips them from all incoming requests before routing (see
+  "Synthetic Groups" above).
 
 No new authorizer is added to the workspace authorization chain. The heavy lifting of
 lifecycle permission evaluation is confined to the VW proxy, which means:
@@ -385,7 +390,8 @@ lifecycle permission evaluation is confined to the VW proxy, which means:
 | WorkspaceType API | SDK `apis/tenancy/v1alpha1/types_workspacetype.go` | Add `InitializerPermissions` and `TerminatorPermissions` fields |
 | Initializing VW content proxy | `pkg/virtual/initializingworkspaces/builder/build.go` | Two modes: in-process RBAC evaluation against `initializerPermissions` then forward with synthetic group (explicit perms), or owner impersonation (fallback) |
 | Terminating VW content proxy | `pkg/virtual/terminatingworkspaces/builder/build.go` | Same two-mode logic for `terminatorPermissions` |
-| Workspace content authorizer | `pkg/authorization/workspace_content_authorizer.go` | Allow `Terminating` phase; trust synthetic groups as pre-authorized; strip synthetic groups from non-VW requests |
+| Workspace content authorizer | `pkg/authorization/workspace_content_authorizer.go` | Allow `Terminating` phase; trust synthetic groups as pre-authorized |
+| Front-proxy group filtering | `pkg/proxy/options/authentication.go` | Add `system:kcp:initializer:*` and `system:kcp:terminator:*` to `--authentication-drop-groups` defaults |
 
 ### Part 3: Terminating Virtual Workspace Content Proxy
 
@@ -522,7 +528,8 @@ Phase 3: Declarative RBAC on WorkspaceType (ephemeral)
     proxies (evaluate request against WorkspaceType permissions before forwarding)
   - Implement synthetic group injection when forwarding
   - Update workspace content authorizer to trust synthetic groups as pre-authorized
-    and strip them from non-VW requests
+  - Add synthetic groups to front-proxy `--authentication-drop-groups` defaults
+    to prevent client self-assertion
   - Fallback to owner impersonation when permissions are empty
   - Add e2e tests for fine-grained permissions
 ```
