@@ -1,6 +1,4 @@
-# Workspace Migration
-
-... or "logical cluster" migration to be precise.
+# Logical Cluster Migration
 
 ## Overview
 
@@ -8,7 +6,7 @@ This proposal drafts a mechanism to migrate logical clusters between shards.
 
 ## Motivation
 
-Shards grow with time, as do the workspaces they contain.
+Shards grow with time, as do the logical clusters they contain.
 
 Currently a kcp instance can scale horizontally by adding more shards or
 vertically by increasing the available resources for a shard.
@@ -16,14 +14,14 @@ vertically by increasing the available resources for a shard.
 While increasing the resources for a shard is an option there is an
 upper limit as to what the underlying infrastructure can provide.
 
-Adding more shards is only a solution for new workspaces. Not if a shard
-is already overprovisioned. Similarly if the existing workspaces on
-a shard grow over time the total size of the workspaces might start to
-reach etcd limits.
+Adding more shards is only a solution for new logical clusters. Not if
+a shard is already overprovisioned. Similarly if the existing logical
+clusters on a shard grow over time the total size of the logical
+clusters might start to reach etcd limits.
 
 ### Goals
 
-1. Provide a primitive for platform operators to migrate logical clusters between shards
+1. Provide a primitive for platform admins to migrate logical clusters between shards
 2. Logical clusters must retain their identity
 3. The migration must not interrupt other operations
 4. The migration may interrupt operations related to the logical cluster
@@ -34,36 +32,17 @@ reach etcd limits.
 
 ## Proposal
 
-Introduce the API group `migration.kcp.io` with three types:
+Add a new per-shard system workspace `system:migration` to contain shard-local migration objects.
 
-- `WorkspaceMigration`
-- `WorkspaceMigrationOrigin`
-- `WorkspaceMigrationDestination`
-
-The `WorkspaceMigration` is created by the operator and updated based on
-the other two types. `WorkspaceMigrationOrigin` and
-`WorkspaceMigrationDestination` are created and maintained by the origin
-and destination shard respectively and owned in the cache-server.
-
-At least two objects will be required to orchestrate the migration
-through the cache server as the cache-server is an unidirectional sync
-between the owning shard and the cache-server.
-
-### WorkspaceMigration
-
-WorkspaceMigration is created by the operator and its conditions are
-updated from the stati of the `WorkspaceMigrationOrigin` and
-`-Destination`.
-
-The object is replicated to the cache-server.
+Introduce the API group `migration.kcp.io` with the type `LogicalClusterMigration`:
 
 ```yaml
-kind: WorkspaceMigration
+kind: LogicalClusterMigration
 apiVersion: migration.kcp.io/v1alpha1
 metadata:
   name: migration
 spec:
-  workspace: root:a:b:c
+  logicalCluster: 1a2b3c4d
   destinationShard: shard-b
 status:
   phase: Migrating
@@ -79,55 +58,21 @@ status:
     type: MigrationStarted
 ```
 
-### WorkspaceMigrationOrigin
+This object exists in triplicate:
 
-WorkspaceMigrationOrigin is created by the origin shard.
+1. The version the admin created
+   This can be anywhere the admin bound the API.
+2. In the `system:migration` workspace of the origin shard
+3. In the `system:migration` workspace of the destination shard
 
-The object is replicated to the cache-server.
+The resource is replicated to the cache-server, which is used to
+coordinate the migration.
 
-```yaml
-kind: WorkspaceMigrationOrigin
-apiVersion: migration.kcp.io/v1alpha1
-metadata:
-  name: migration
-spec:
-  migrationRef:
-    name: migration
-status:
-  phase: Waiting
-  conditions:
-  - lastTransitionTime: "2026-05-01T22:28:40Z"
-    status: "True"
-    type: OriginPreparing
-  - lastTransitionTime: "2026-05-01T22:29:00Z"
-    status: "True"
-    type: OriginReady
-  logicalCluster: 1a2b3c4d
-  originShard: shard-a
-  migrationEndpoint: https://shard-a.kcp.io/services/migratingworkspaces/
-```
+The stati and phase from the copies from the origin and destination
+shard are reflected on the admin's copy.
 
-### WorkspaceMigrationDestination
-
-WorkspaceMigrationDestination is created by the destination shard.
-
-The object is replicated to the cache-server.
-
-```yaml
-kind: WorkspaceMigrationDestination
-apiVersion: migration.kcp.io/v1alpha1
-metadata:
-  name: migration
-spec:
-  migrationRef:
-    name: migration
-status:
-  phase: Migrating
-  conditions:
-  - lastTransitionTime: "2026-05-01T22:30:15Z"
-    status: "True"
-    type: MigrationStarted
-```
+The origin and destination are only updating their own copy in their own
+workspace and reacting to updates on the other shard's copy.
 
 ### migration virtual workspace
 
@@ -156,7 +101,7 @@ kcp itself will filter objects related to this logical cluster on the informer l
 
 ### Process
 
-The entire process is orchestrated through the `WorkspaceMigration*` objects, meaning shards communicate via the cache-server.
+The entire process is orchestrated through the `LogicalClusterMigration` objects, meaning shards communicate via the cache-server.
 
 1. The origin shard annotates the logical cluster with `internal.kcp.io/migrating=true`.
 
@@ -168,13 +113,13 @@ The entire process is orchestrated through the `WorkspaceMigration*` objects, me
 
 2. The origin shard configures its informers to ignore objects related to this LC.
 
-3. The origin shard updates the `WorkspaceMigrationOrigin` status with the relevant vw information.
+3. The origin shard updates the status of their copy of the `LogicalClusterMigration` object with the relevant vw information.
 
 4. The destination shard configures its informers to ignore objects related to the migrating LC to prevent e.g. the regular resync from discovering objects in etcd and starting reconciles on the incomplete logical cluster.
 
-5. The destination shard reads the objects through the migrating virtual workspace (retrieved from the `WorkspaceMigrationOrigin` object) and writes them directly to the etcd.
+5. The destination shard reads the objects through the migrating virtual workspace (retrieved from the `LogicalClusterMigration` object from the origin) and writes them directly to the etcd.
 
-   After the data is copied and verified this is reflected on the `WorkspaceMigrationDestination` object.
+   After the data is copied and verified this is reflected on the destination copy of the `LogicalClusterMigration` object.
 
 6. The origin shard deletes logical cluster object and its objects from the etcd.
 
@@ -201,10 +146,10 @@ local copy.
 #### Failstate Handling
 
 If the process stalls or fails at any point the error will be noted on
-the `WorkspaceMigration` object and reconciliation will halt to prevent
-data loss.
+the `LogicalClusterMigration` object and reconciliation will halt to
+prevent data loss.
 
-At that point an operator will have to take action.
+At that point an admin will have to take action.
 
 By copying over all objects first it is guaranteed that the entire
 logical cluster is always available on either the origin or destination
