@@ -32,13 +32,11 @@ clusters might start to reach etcd limits.
 
 ## Proposal
 
-Add a new per-shard system workspace `system:migration` to contain shard-local migration objects.
-
-Introduce the API group `migration.kcp.io` with the type `LogicalClusterMigration`:
+Add the type `LogicalClusterMigration` in the `core.kcp.io` group:
 
 ```yaml
 kind: LogicalClusterMigration
-apiVersion: migration.kcp.io/v1alpha1
+apiVersion: core.kcp.io/v1alpha1
 metadata:
   name: migration
 spec:
@@ -58,21 +56,13 @@ status:
     type: MigrationStarted
 ```
 
-This object exists in triplicate:
+This object exists wherever the admin created it.
 
-1. The version the admin created
-   This can be anywhere the admin bound the API.
-2. In the `system:migration` workspace of the origin shard
-3. In the `system:migration` workspace of the destination shard
+The object is replicated to the cache-server.
 
-The resource is replicated to the cache-server, which is used to
-coordinate the migration.
+The origin and destination shard update this object as the migration progresses through the front-proxy.
 
-The stati and phase from the copies from the origin and destination
-shard are reflected on the admin's copy.
-
-The origin and destination are only updating their own copy in their own
-workspace and reacting to updates on the other shard's copy.
+That means writes are synchronous through the front-proxy, reaction happens through the replication via the cache-server.
 
 ### migration virtual workspace
 
@@ -113,13 +103,13 @@ The entire process is orchestrated through the `LogicalClusterMigration` objects
 
 2. The origin shard configures its informers to ignore objects related to this LC.
 
-3. The origin shard updates the status of their copy of the `LogicalClusterMigration` object with the relevant vw information.
+3. The origin shard updates the status of the `LogicalClusterMigration` object with the relevant vw information.
 
 4. The destination shard configures its informers to ignore objects related to the migrating LC to prevent e.g. the regular resync from discovering objects in etcd and starting reconciles on the incomplete logical cluster.
 
 5. The destination shard reads the objects through the migrating virtual workspace (retrieved from the `LogicalClusterMigration` object from the origin) and writes them directly to the etcd.
 
-   After the data is copied and verified this is reflected on the destination copy of the `LogicalClusterMigration` object.
+   After the data is copied and verified this is reflected in the status `LogicalClusterMigration` object.
 
 6. The origin shard deletes logical cluster object and its objects from the etcd.
 
@@ -139,9 +129,8 @@ The destination shard is responsible for validating that the copied data
 is complete and equivalent to the data on the origin shard.
 
 Something to explore would be a `SelfAccessReview` or
-`TokenReview`-style resource in the `migration.kcp.io` API that allows
-to request a merkle tree hash of the objects to compare against the
-local copy.
+`TokenReview`-style resource that allows to request a merkle tree hash
+of the objects to compare against the local copy.
 
 #### Failstate Handling
 
