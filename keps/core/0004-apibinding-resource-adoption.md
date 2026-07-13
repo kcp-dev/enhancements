@@ -15,7 +15,9 @@ outage window.
 
 This proposal adds first-class **resource adoption**: the ability to hand bound resource
 instances over from one APIBinding to another (or a set of others) without deleting and
-re-creating them, plus an **orphan deletion policy** as the underlying building block.
+re-creating them, plus a **wait-for-successor deletion policy** as the underlying
+building block, preserving the invariant that every instance in storage is covered by a
+live APIBinding at all times.
 Adoption is zero-copy and therefore requires the successor export to serve the **same
 storage** — same APIResourceSchema UID, same identity. This is by design and permanent:
 migrations always happen under the same identity. Changing identity is a separate,
@@ -92,8 +94,9 @@ the GR lock. Everything needed to *verify* that safety condition is already in t
 * Schema-divergent handover (successor export referencing a *different* schema for the
   same GR), even if structurally compatible. Same-UID is the alpha criterion; relaxing
   it can be revisited later.
-* Garbage-collecting orphaned storage. Orphaned instances are bounded by workspace
-  lifetime (workspace deletion removes them).
+* Any state in which instances exist in storage without a live APIBinding covering
+  them. An earlier draft proposed an `Orphan` policy; it was rejected in review (see
+  Alternatives) precisely because dangling objects fall outside the resource model.
 
 ## Proposal
 
@@ -105,39 +108,41 @@ Two pieces, one building on the other.
 apiVersion: apis.kcp.io/v1alpha2
 kind: APIBinding
 spec:
-  deletionPolicy: Delete | Orphan   # default: Delete
+  deletionPolicy: Delete | WaitForSuccessor   # default: Delete
 ```
 
 * `Delete` — today's behavior, unchanged, remains the default.
-* `Orphan` — on binding deletion, the deletion controller **skips instance deletion**
-  entirely: it releases the GR locks in `internal.apis.kcp.io/resource-bindings`,
-  removes the finalizer, and leaves all instances in storage. They become unreachable
-  through the workspace API until some binding binds the same GR with the same identity
-  and schema again — at which point they simply reappear, untouched.
+* `WaitForSuccessor` — the binding's finalizer is **not released** until every bound
+  group/resource has a verified successor (see below) to hand its instances to. Until
+  then the binding stays in `Terminating` with
+  `BindingResourceDeleteSuccess=False` / reason `WaitingForSuccessor`, listing the
+  group/resources still waiting. Instances are never deleted and never invisible:
+  throughout the wait they remain served through the deleting binding (read-only,
+  per today's deletion semantics), and the moment a successor appears they are handed
+  over per-GR.
 
-The field is mutable at any time before deletion, so the intended flow is "patch policy,
-then delete". Deleting a binding with `Orphan` and never creating a successor strands
-the data until workspace deletion; the deletion controller emits a warning event
-(`OrphanedResources`, with per-GR instance counts) so this is observable, but it is not
-prevented — it is the user's explicit choice.
+This preserves a hard invariant the resource model can rely on: **every instance in
+storage is covered by a live APIBinding at all times** — either the deleting one or its
+successor. There is no dangling state:
+
+* No quota interaction: instances always remain visible and countable through a
+  binding, so object-count quota (API-based or etcd-based) never counts objects the
+  user cannot see or delete.
+* No invisible storage: a migration that stalls is a binding conspicuously stuck in
+  `Terminating` with a condition saying exactly what it waits for — first-class,
+  debuggable state instead of orphaned bytes.
+* Abortable in both directions: patch `deletionPolicy` back to `Delete` to let the
+  deletion proceed destructively, or create the missing successor to complete the
+  handover.
+
+The field is mutable at any time, including while the binding is terminating, so the
+decoupled-timing flow ("delete the old binding now, bring up successors later, e.g.
+across a large fleet") still works — the binding simply waits instead of destroying or
+stranding anything.
 
 ### 2. Adoption: verified per-GR handover
 
-With `Orphan` alone, the migration for the wildwest split becomes:
-
-```sh
-kubectl apply -f apibindings-split.yaml      # successors sit in NamingConflicts — expected
-kubectl patch apibinding wildwest --type=merge -p '{"spec":{"deletionPolicy":"Orphan"}}'
-kubectl delete apibinding wildwest
-kubectl wait apibinding cowboys sheriffs --for=condition=Ready
-# same objects, same UIDs, same status — nothing was deleted or restored
-```
-
-This already works without any per-object operation, but it puts the safety burden on
-the user: if the successor exports do *not* reuse the identity or reference different
-schemas, the data silently stays stranded instead of reappearing.
-
-Adoption closes that gap by making the handover **verified and observable**:
+Adoption makes the handover **verified and observable**:
 
 * When the deletion controller processes a binding (any policy), it first computes, for
   each entry in `status.boundResources`, whether a **successor** exists: another
@@ -147,9 +152,12 @@ Adoption closes that gap by making the handover **verified and observable**:
 * For every GR with a verified successor, instances are **not deleted** — regardless of
   `deletionPolicy` — and the GR lock is handed to the successor binding atomically in
   the same `resource-bindings` annotation update that releases it, so no third binding
-  can race in between.
+  can race in between. (Equivalently, viewed from the successor's side: when the
+  apibinding reconciler evaluates a naming conflict and the conflicting lock holder is
+  a deleting binding whose bound resource it can verifiably adopt, it takes the lock
+  over instead of reporting `NamingConflicts`.)
 * For every GR without a successor, `deletionPolicy` decides: `Delete` deletes (today's
-  behavior), `Orphan` orphans with the warning event.
+  behavior), `WaitForSuccessor` holds the finalizer and requeues until one appears.
 * The successor binding surfaces adoption in status: a new condition
   `ResourcesAdopted` and an event naming the predecessor binding and per-GR instance
   counts. If a would-be successor exists but fails verification (different identity or
@@ -167,11 +175,12 @@ kubectl wait apibinding cowboys sheriffs --for=condition=Ready
 > [!IMPORTANT]
 > No `deletionPolicy` change is needed on this path — handover applies regardless of
 > policy. The policy only decides the fate of GRs that have **no** verified successor at
-> deletion time: `Delete` destroys them (today's behavior), `Orphan` strands them
-> recoverably. Patching to `Orphan` before the swap is therefore a recommended
-> belt-and-braces step, not a requirement: if a successor turns out to be misconfigured
-> (wrong identity, wrong schema) at the moment of deletion, `Orphan` converts the failure
-> mode from data loss into a stranded state that reappears once the successor is fixed.
+> deletion time: `Delete` destroys them (today's behavior), `WaitForSuccessor` blocks
+> finalization until one appears. Patching to `WaitForSuccessor` before the swap is
+> therefore a recommended belt-and-braces step, not a requirement: if a successor turns
+> out to be misconfigured (wrong identity, wrong schema) at the moment of deletion, it
+> converts the failure mode from data loss into a visible, waiting `Terminating` binding
+> that completes the instant the successor is fixed.
 
 The API-unavailability window shrinks to the reconcile gap between lock handover and the
 successor binding becoming bound (the bound CRD never goes away — it is keyed by schema
@@ -227,10 +236,11 @@ small; 0005 touches the storage layer and can follow independently.
 // APIBindingSpec
 // deletionPolicy controls what happens to instances of bound resources when
 // this APIBinding is deleted and no successor binding adopts them.
-// "Delete" (default) deletes all instances. "Orphan" leaves them in storage,
-// unreachable until a binding with the same schema and identity binds the
-// group/resource again.
-// +kubebuilder:validation:Enum=Delete;Orphan
+// "Delete" (default) deletes all instances. "WaitForSuccessor" holds the
+// binding's finalizer until every bound group/resource has a verified
+// successor binding to adopt its instances; the binding stays in Terminating
+// and the instances stay served until the handover completes.
+// +kubebuilder:validation:Enum=Delete;WaitForSuccessor
 // +kubebuilder:default=Delete
 // +optional
 DeletionPolicy APIBindingDeletionPolicy `json:"deletionPolicy,omitempty"`
@@ -253,7 +263,14 @@ New condition types on APIBinding status:
   per GR (an indexer on APIBindings by referenced export → GR/schema-UID/identityHash
   already exists in spirit via `indexers.APIBindingByBoundResources`-style indexes);
   filter the GVR deletion list accordingly; hand over locks in the same LogicalCluster
-  update that would have released them.
+  update that would have released them. For `WaitForSuccessor`, unmatched GRs feed the
+  existing "resources remaining" requeue machinery instead of being deleted, keeping
+  the finalizer held.
+* `WaitForSuccessor` must degrade to `Delete` when the **LogicalCluster itself is
+  deleting**: workspace teardown deletes bindings as part of removing all content, and
+  a binding waiting for a successor that can never come would deadlock the workspace
+  in `Terminating`. The deletion controller checks the LogicalCluster's deletion
+  timestamp and skips the wait in that case.
 * `pkg/reconciler/apis/apibinding`: on conflict evaluation, when the conflicting
   binding has a deletion timestamp, surface `AdoptionBlocked` vs. pending-adoption in
   conditions instead of a bare `NamingConflicts`.
@@ -263,9 +280,11 @@ New condition types on APIBinding status:
 * Virtual workspaces / permission claims need no change: both key on identityHash,
   which is unchanged by definition of a verified adoption.
 * e2e: replicate the wildwest split (one export, two resources → two exports) and
-  assert instance UIDs are identical before and after the swap; plus an orphan-without-
-  successor test asserting the warning event and that workspace deletion still cleans
-  up.
+  assert instance UIDs are identical before and after the swap; plus a
+  WaitForSuccessor test asserting the binding stays in `Terminating` with the
+  `WaitingForSuccessor` condition while no successor exists, that instances remain
+  served throughout the wait, and that the handover (and finalization) completes as
+  soon as the successor is created.
 
 ## Alternatives Considered
 
@@ -282,15 +301,28 @@ New condition types on APIBinding status:
   with ownerReferences).** Unnecessary: kcp's storage model already has no per-object
   binding ownership, so stamping would add write amplification only to enable a
   mechanism that works without it.
+* **`Orphan` deletion policy (earlier draft of this KEP).** Deletion would release the
+  finalizer and leave instances in storage, unreachable until a matching binding
+  reappeared. Rejected in review: dangling objects are outside the resource model —
+  they occupy etcd while being invisible to (and undeletable by) the user, which
+  breaks object-count quota in both directions and invites unknown corner cases in
+  anything that assumes every stored object is reachable through the API.
+  `WaitForSuccessor` provides the same decoupled-timing migration flow while keeping
+  every instance covered by a live binding at all times; a stalled migration is a
+  binding visibly stuck in `Terminating` rather than invisible bytes.
 
 ## Risks and Mitigations
 
-* **Stranded storage via `Orphan` without successor.** Explicit opt-in, warning event
-  with instance counts, bounded by workspace lifetime. Default remains `Delete`.
+* **A `WaitForSuccessor` binding waits forever.** Explicit opt-in, visible as a
+  `Terminating` binding with the `WaitingForSuccessor` condition listing exactly which
+  group/resources lack a successor. Resolvable at any time by creating the successor
+  or patching the policy back to `Delete`. Workspace deletion overrides the wait and
+  cleans up regardless (workspace teardown deletes all content anyway). Default
+  remains `Delete`.
 * **Adoption races (successor created concurrently with deletion).** Lock handover and
-  lock release happen in a single LogicalCluster annotation update; a successor that
-  misses the handover window finds the lock free and binds normally — instances
-  reappear either way, since they were orphaned per the verified-successor rule.
+  lock release happen in a single LogicalCluster annotation update; with
+  `WaitForSuccessor`, a successor that misses one evaluation is simply picked up on a
+  later requeue — the deletion does not proceed without it.
 * **Split-brain across shards.** APIBindings, their LogicalCluster, and the bound
   instances are co-located on the consumer workspace's shard; the handover touches only
   shard-local state. Export/schema lookups go through the cache server as they already
@@ -308,7 +340,7 @@ New condition types on APIBinding status:
 > completed. Migrating APIBindings/APIExports while simultaneously changing identity is
 > out of scope by design: never combine the two steps. This keeps each step trivially
 > verifiable — the handover moves no data, and the rotation changes no bindings.
-* **A provider with a write claim on `apibindings` can orphan or delete consumer
+* **A provider with a write claim on `apibindings` can stall or delete consumer
   data.** Not a new power in kind — such a claim already allows deleting the binding,
   which today deletes the data. `deletionPolicy` makes the outcome *less* destructive,
   but the trust boundary is documented explicitly in the provider-orchestrated
