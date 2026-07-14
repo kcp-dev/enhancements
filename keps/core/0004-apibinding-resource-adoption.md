@@ -319,6 +319,17 @@ New condition types on APIBinding status:
   or patching the policy back to `Delete`. Workspace deletion overrides the wait and
   cleans up regardless (workspace teardown deletes all content anyway). Default
   remains `Delete`.
+* **Manually stripping the finalizer bypasses any deletionPolicy.** Removing
+  `apis.kcp.io/apibinding-finalizer` from a terminating binding deletes the object
+  immediately — the API server, not the controller, decides that — and whatever
+  cleanup or handover was pending never happens: the instances are orphaned. This is
+  not new to this KEP: stripping the finalizer mid-`Delete` orphans whatever the
+  cleanup had not reached yet on every kcp version today. It is the standard
+  Kubernetes escape hatch of last resort, deliberately left open (an admission guard
+  refusing finalizer removal would turn a stuck binding into an unfixable one when the
+  controller itself is broken) and guarded by RBAC on binding updates. Recovery from
+  an accidental strip is the adoption property itself: bind the same schema UID and
+  identity again and the instances reappear untouched.
 * **Adoption races (successor created concurrently with deletion).** Lock handover and
   lock release happen in a single LogicalCluster annotation update; with
   `WaitForSuccessor`, a successor that misses one evaluation is simply picked up on a

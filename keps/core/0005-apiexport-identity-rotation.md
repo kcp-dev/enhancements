@@ -112,8 +112,8 @@ workspace it:
    requests — exactly what the copy needs, since in-flight writes and watches must not
    straddle the flip. This is coarser than strictly necessary (the whole workspace is
    offline, not just the affected group/resource), but it is battle-tested and already
-   understood by clients; a per-GR write-only fence is a possible later optimization,
-   not a requirement,
+   understood by clients. A finer, per-GR fence is deliberately left as a follow-up
+   (see "Follow-up: per-GR write-only fence") rather than a requirement,
 2. copies all keys from `/registry/<g>/<r>/<oldHash>/<cluster>/...` to
    `/registry/<g>/<r>/<newHash>/<cluster>/...` via storage handles — never through the
    workspace API, which is what preserves UIDs and bytes,
@@ -223,6 +223,72 @@ identity for the zero-copy split (KEP 0004), wait until all consumers have migra
 the bindings are settled, then rotate `cowboys` and `sheriffs` onto fresh identities at
 leisure, and finally delete the stale `wildwest` secret.
 
+### Authorization: rotation is a platform-owned capability, not an export-owner one
+
+The disruptive primitive in a rotation is not the data copy — it is **step 1 of the
+migrator: fencing consumer LogicalClusters** by setting `core.kcp.io/inactive` on them.
+That fence takes an entire consumer workspace offline (reads included, all resources, not
+just the bound group/resource — see the migrator flow). An actor able to trigger it
+across every binding of an export can black out every consumer of that export at will,
+and loop it. This is a consumer-facing DoS vector, so the ability to rotate must sit in
+the **platform-owner** domain, not be an implicit power of owning an APIExport.
+
+Two facts about kcp make this enforceable *even against a provider-workspace
+cluster-admin*, which ordinary "default-deny in the bootstrap RBAC" would not achieve (a
+local cluster-admin can grant themselves any local verb):
+
+* **Workspace cluster-admin is scoped to that workspace.** A provider-workspace
+  cluster-admin has no authority in the root workspace and none in any consumer
+  workspace — workspaces are isolation boundaries, not a hierarchy where admin flows
+  down. An authorization decision evaluated against **root** is therefore structurally
+  outside a provider-workspace admin's reach, no matter what RBAC they write locally.
+* **The rotation controller is the only lever.** Fencing a consumer means writing
+  `core.kcp.io/inactive` on a LogicalCluster in *another* workspace, which a
+  provider-workspace admin cannot do directly (cross-workspace write, denied). Their only
+  route to the fence is the rotation controller (a system actor). So gating that one path
+  closes the vector completely — there is no side door.
+
+The gate is therefore placed **outside the provider workspace**, in two layers:
+
+1. **Admission on `APIExportIdentityRotation` create** issues a SubjectAccessReview for
+   the *requesting user* against a dedicated verb in the **root** (or a configured
+   platform) workspace — not against the local workspace, so local RBAC (including local
+   cluster-admin) is never consulted. This mirrors kcp's existing cross-workspace
+   admission authorization: the workspace content authorizer checks `access`/`admin` on
+   the workspace object in the **parent**, and WorkspaceType selection checks the `use`
+   verb on the type in the type's **own** workspace. Rotation points the same kind of
+   check at root.
+2. **Controller re-check (defense in depth).** The requesting user is recorded on the
+   object; the controller re-verifies that user's root-level grant before it fences
+   anything. Creation is intent only — a rotation with no platform authorization sits in
+   `Pending` forever. So even a bypass at the object layer (finalizer games, direct etcd
+   writes) cannot fence a consumer, because execution is gated independently of creation.
+
+A provider-workspace cluster-admin can thus freely create the rotation object, self-grant
+every local verb, and edit it — and it does nothing, because the one authority that
+matters (`rotate` in root) is one they cannot grant themselves.
+
+**Delegation.** The platform may grant the root-level rotation permission to a trusted
+provider via RBAC — for example so a first-party provider can self-serve leaked-secret
+remediation without filing a platform ticket, which is a security-urgent, provider-
+initiated operation. This is an explicit, auditable, revocable trust decision, *not*
+something implied by export ownership. A delegated provider can then rotate (and, in
+principle, loop it); that residual capability is intended and bounded by the per-export
+cooldown and one-active-rotation-per-export invariants below, not a hole.
+
+> [!IMPORTANT]
+> This holds only while the rotation controller and its admission plugin are the sole
+> path to (a) setting `core.kcp.io/inactive` on a not-owned LogicalCluster and (b) the
+> storage drain. By kcp's workspace-isolation model there is no other path; this KEP
+> states that as an explicit security assumption so any future API that could fence a
+> foreign workspace is evaluated against it.
+
+Defense-in-depth invariants (enforced by admission on `APIExportIdentityRotation`):
+
+* At most one active rotation per export (already required for correctness).
+* A **minimum interval between completed rotations** of the same export, so even a
+  delegated-but-compromised provider cannot loop rotations into a sustained fence.
+
 ### Interaction with cross-export permission claims
 
 Identity is not only a storage key — it is the public token by which **other exports
@@ -276,6 +342,37 @@ Cross-shard, nothing new is needed beyond the alias replication: claim resolutio
 already goes through cache-server-fed informers, and the labelers run shard-locally in
 the workspaces where the claimed objects live.
 
+### Follow-up: per-GR write-only fence
+
+The alpha reuses the coarse `core.kcp.io/inactive` fence, which takes the whole consumer
+workspace offline for the duration of the copy even though rotation only ever touches one
+group/resource's etcd prefix. A natural improvement — explicitly a **follow-up, not part
+of this KEP** — is a per-GR, write-only fence: pause mutating requests to just the
+rotating GR and leave reads and every other resource in the workspace serving normally.
+
+This is feasible on the existing machinery without new architecture. The fence lives in
+the same HTTP filter chain as today's whole-cluster fences
+(`pkg/server/filters/inactivelogicalcluster.go`,
+`pkg/server/filters/migratinglogicalcluster.go`), which already carry the request's
+`RequestInfo` — the migrating filter branches on `requestInfo.Verb` today, and the same
+`RequestInfo` also carries `APIGroup`/`Resource`. A per-GR fence would branch on those to
+reject only mutating verbs on the rotating GR, driven off the in-progress
+`identityHashes` state this KEP already introduces (a GR is fenced iff its
+`identityHashes` has more than one entry) rather than a workspace-wide boolean. Same-shard
+rotation also sidesteps the reason the migrating filter has to special-case list/watch
+resource versions (that concern is cross-shard).
+
+It is intentionally deferred, not adopted now, because **narrowing the fence to a single
+GR does not obviously bound the blast radius to that GR.** Objects of other resources may
+be indirectly coupled to the rotating one — owner references, controllers that watch the
+rotating GR and write elsewhere, admission/validation that reads across resources, quota
+— and letting those keep mutating while the target GR's storage is mid-flip could produce
+exactly the straddling inconsistency the coarse fence was chosen to avoid. We do not yet
+know the full set of such couplings, so the responsible default is the whole-workspace
+fence (correct, if blunt) for alpha, and to gather feedback on real rotations before
+scoping the fence down. This follow-up therefore strictly *improves* the outage story
+without changing the alpha's correctness guarantees.
+
 ### Observability: `IdentityShared`
 
 The apiexport reconciler gains an informational condition when an export's identity
@@ -324,8 +421,14 @@ New resource `APIExportIdentityRotation` (apis.kcp.io/v1alpha2, see the flow sec
 for the full shape): one-shot rotation request living next to the APIExport, with
 `spec.{export, newIdentity.secretRef, aliasRetirement}` and
 `status.{phase, oldIdentityHash, newIdentityHash, migratedBindings, totalBindings}`.
-Admission on it enforces the invariants: one active rotation per export, and rejection
-while any binding of the export is mid-migration (KEP 0004).
+Admission on it enforces the invariants: one active rotation per export, rejection
+while any binding of the export is mid-migration (KEP 0004), a minimum interval between
+completed rotations of the same export, and — the trust-boundary control (see
+Authorization) — a SubjectAccessReview for the requesting user against a dedicated
+`rotate` verb in the **root** workspace, so that `create` is *not* implied by APIExport
+ownership and cannot be self-authorized by a provider-workspace cluster-admin. The
+bootstrap policy grants that root-level verb only to platform administrators; platforms
+may delegate it to trusted providers via RBAC.
 
 APIExport:
 
@@ -388,6 +491,17 @@ down-conversion; v1alpha1 clients see the current identityHash as today.
 
 ## Risks and Mitigations
 
+* **Rotation as a consumer-facing DoS vector.** The fence (`core.kcp.io/inactive`) takes
+  whole consumer workspaces offline, so an actor able to loop rotations across an
+  export's bindings could black out every consumer. Mitigated by making rotation a
+  platform-owned capability rather than an implicit power of export ownership (see
+  Authorization): `create` on `APIExportIdentityRotation` is authorized against a
+  dedicated `rotate` verb in the **root** workspace, which a provider-workspace
+  cluster-admin cannot self-grant (workspace admin is scoped to its workspace); the
+  controller re-checks that grant before fencing, so an unauthorized rotation never
+  leaves `Pending`; and per-export cooldown plus one-active-rotation-per-export bound
+  even a delegated provider. The rotation controller being the sole path to fencing a
+  not-owned LogicalCluster is stated as an explicit security assumption.
 * **Migration interrupted mid-drain.** `identityHashes` keeps both hashes until the
   drain is verified complete, so a crashed migrator resumes idempotently, and the
   inactive fence means no writes land in-between. Count verification gates old-prefix
