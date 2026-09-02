@@ -13,6 +13,16 @@ shards remain discoverable in one place.
 Tracking issue: [kcp-dev/kcp#4335](https://github.com/kcp-dev/kcp/issues/4335).
 Proof of concept: [kcp-dev/kcp#4337](https://github.com/kcp-dev/kcp/pull/4337).
 
+> **Update:** the view and write layer of this KEP (the `:root` mirror and
+> the annotation back-sync, option B below) is superseded by the
+> [Admin workspace](shard-aggregated-admin-view.md): an aggregated,
+> cache-backed view at `/services/admin` with allow-listed writes carried
+> through the cache (option C). What remains in scope here is moving the
+> authoritative `Shard` object into the shard-local `system:shard` cluster
+> (local registration), plus the `Schedulable` condition ack and the shard
+> CLI. Rebased onto the Admin workspace, the mirror and back-sync of the POC
+> are dropped and root ends up holding no shard state at all.
+
 ## Motivation
 
 - A shard cannot finish registration while the root shard is down. With
@@ -74,9 +84,10 @@ design works, not to lock it in.
 
 ### Breaking changes
 
-- The `Shard` object in the `:root` workspace becomes read-only. Edits (spec,
-  labels, annotations) are overwritten by the mirror. Shard configuration
-  moves to the shard's flags/deployment.
+- The `Shard` object in the `:root` workspace becomes read-only, with the
+  exception of a small allow-list of back-synced annotations (see below).
+  Other edits (spec, labels, annotations) are overwritten by the mirror.
+  Shard configuration moves to the shard's flags/deployment.
 - Labels are re-applied from flags on every shard restart. Labels set via the
   API do not survive.
 
@@ -92,9 +103,11 @@ shard centrally. This proposal removes it. Two operations are affected:
    authoritative object, its cache copy, and its representation stay around
    until someone deletes them where they live.
 
-Under this proposal, both require talking to the shard's own endpoint
-(`<shard-base-url>/clusters/system:shard`), or deleting cache-server state
-directly if the shard is permanently gone.
+Under this proposal, without further machinery both require talking to the
+shard's own endpoint (`<shard-base-url>/clusters/system:shard`), or deleting
+cache-server state directly if the shard is permanently gone. For cordoning,
+option B below is implemented (see Recommendation); decommissioning remains
+open.
 
 ### Options
 
@@ -113,12 +126,35 @@ therefore a combination, e.g. C plus a proper spec field.
 
 ### Recommendation
 
-Start with A. That matches the current state, where the annotation is only
-used by tests. When cordon/decommission become supported operator features,
-build C: it is the only option where shards still never need root and root
-never connects to shards, and the replication channel it needs already exists.
-B is a reasonable stopgap if C is too far out. D alone does not work for
-cordon.
+Start with B for cordoning, limited to a single allow-listed annotation. The
+POC implements it: the mirror treats `experimental.core.kcp.io/unschedulable`
+as owned by the representation — an admin sets (or removes) it on the `Shard`
+representation in `:root`, the mirror preserves it there instead of
+overwriting it, and syncs it back onto the authoritative object over a direct
+connection to the owning shard, reusing the logical-cluster-admin credentials
+and the client-pool pattern the workspace scheduler already uses for
+cross-shard writes. Authorization-wise this means the logical-cluster-admin
+identity is allowed into `system:*` logical clusters (previously
+system-masters only) and gets get/update/patch on `shards` in the bootstrap
+policy.
+
+This accepts B's known cost: root connects to shards again, and there are two
+writers on the authoritative object (limited to the allow-list, with the
+representation as the single owner of those keys — absence on the
+representation means removal).
+
+The receiving shard acknowledges the signal the way a Kubernetes node would:
+a controller on every shard keeps a `Schedulable` status condition on its own
+authoritative object in sync with the annotation (`False`/`Cordoned` while
+cordoned, `True` otherwise). Since the mirror copies status onto the
+representation, the condition surfacing in `:root` confirms the cordon was
+received and applied end to end. (Kubernetes itself acks `spec.unschedulable`
+with the `node.kubernetes.io/unschedulable` taint; shards have no taints, so
+a condition is the closest equivalent, and leaves room for future health
+reasons the way node conditions do.) When cordon/decommission grow beyond a single
+annotation, build C: it is the only option where shards never need root and
+root never connects to shards, and the replication channel it needs already
+exists. D alone does not work for cordon.
 
 Decommissioning also needs a heartbeat or lease on the authoritative object
 (renewed locally, so cheap under this proposal), so that dead shards can be
