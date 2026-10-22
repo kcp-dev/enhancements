@@ -25,7 +25,8 @@ by decoupling the identity and secrets.
 ### Non-Goals
 
 - Implementing new API serving authorization mechanisms, e.g. OIDC-based
-  instead of a secret in the workspace.
+  instead of a secret in the workspace or by the cluster name the
+  APIExport originates from.
 - Moving consumer data.
 
 ## Proposal
