@@ -1,7 +1,7 @@
 # kcp hub: an extended reference architecture
 
-- Subproject: `kcp-dev/hub`
-- Status: proposal, requires a maintainer vote
+- Repository: external, outside the `kcp-dev` organisation (name to be defined)
+- Status: proposal, for kcp maintainer awareness and endorsement
 - Owner: Mangirdas Judeikis
 
 ## Summary
@@ -11,8 +11,9 @@ organisations, a catalog of services and a way to enable one has to assemble
 that from a dozen repositories and thirty concept pages, with no working
 example that runs end to end. Many give up before they get there.
 
-This proposal creates a subproject, `kcp-dev/hub`: a running end-to-end
-reference of how to build on kcp using upstream best practices. It contains
+This proposal establishes hub, a running end-to-end reference of how to
+build on kcp using upstream best practices, in its own repository outside
+the `kcp-dev` organisation. It contains
 tenancy, a producer catalog, a thin (emphasis on thin!) console, and the
 deployment that wires it to an identity provider. It is usable as-is as a
 base layer and states clearly where "your platform" starts.
@@ -81,15 +82,19 @@ and the end-to-end flow from login to a working kubeconfig. Each on its own
 is simple. Getting them to agree on identity, authorization and workspace
 paths is where it goes wrong, and it is what no upstream example covers.
 
-### Why under kcp-dev
+### Why outside kcp-dev
 
-References maintained outside the org drift and take opinions the maintainers
-would not take, and we cannot point to them. A subproject keeps the
-maintainers in control of what the recommended way is, keeps it on kcp's
-release cadence, and keeps the community in one place. Much of the work will
-come from people outside the current maintainer group. That is fine: it
-still lands under the same review standards, governance and CNCF umbrella as
-every other kcp subproject.
+kcp is an engine and should stay one. A reference platform takes opinions
+on tenancy, catalog and UI that the engine should not take, and hosting it
+under `kcp-dev` would change the project's scope and add load to maintainers
+who did not sign up for it. Keeping hub in its own repository keeps those
+concerns separate: kcp stays unopinionated, hub can move fast, and nothing
+in kcp depends on it.
+
+What hub asks of the kcp project is small: the standalone components it
+builds on stay in `kcp-dev/contrib-virtual-workspaces`, hub is linked from
+the kcp documentation as a worked example of building on kcp, and this
+document records the scope so the two projects do not drift apart.
 
 ## Goals
 
@@ -138,22 +143,24 @@ what they need to run.
 
 ### Deliverables
 
-1. The `kcp-dev/hub` repository with the six pieces, CI, images, and
-   end-to-end tests that execute the walkthrough in goal 1.
+1. The hub repository with the six pieces, CI, images, and end-to-end tests
+   that execute the walkthrough in goal 1.
 2. A walkthrough from zero to an enabled service, in the order a builder
-   should learn kcp, with each step naming the kcp concept it exercises. This
-   becomes the recommended entry point from kcp's docs.
+   should learn kcp, with each step naming the kcp concept it exercises.
+   Linked from kcp's docs as a worked example.
 3. A boundary document in the repository stating what hub will and will not
    accept, referenced from the contributing guide.
 
 ### Governance
 
-- Hub is a subproject with its own OWNERS. The proposed initial approvers are
-  the people already working on it. Existing kcp
-  maintainers are not expected to review or maintain it.
+- Hub has its own organisation, OWNERS, CI and release cadence. The initial
+  approvers are the people already working on it. kcp maintainers are not
+  expected to review or maintain it, and kcp governance does not apply.
 - Frontend code is reviewed by approvers with frontend experience, listed in
   OWNERS for the `ui` directory.
-- Hub is experimental until deemed stable by the kcp project.
+- Hub tracks kcp's latest minor release and is tested against it.
+- Hub is experimental. If it proves itself, moving it under `kcp-dev` can be
+  proposed later, as a separate decision.
 
 ### Relationship to existing work
 
@@ -168,10 +175,12 @@ them into one deployment. Prototype code for all of this exists and runs.
   tenancy and catalog models are interfaces with one shipped implementation.
 - **Alienating downstream platforms.** Mitigation: hub is a base layer and a
   teaching tool for platform builders.
-- **Maintenance load.** Mitigation: dedicated approvers and a sunset clause.
-  Hub has its own CI, independent of kcp's, pinned to kcp releases rather
-  than main. Nothing in kcp's CI depends on hub, and hub can be built and
-  tested outside the org.
+- **Drift from upstream.** An external reference can fall behind kcp or
+  take shortcuts kcp would not. Mitigation: CI pinned to kcp releases,
+  the kcp-facing components stay upstream in contrib-virtual-workspaces, and
+  contributors overlap with kcp.
+- **Maintenance load on kcp.** None by construction. Nothing in kcp's CI or
+  release depends on hub.
 - **Frontend review.** Mitigation: named frontend approvers. The console is
   static CRUD with no privileged backend.
 
@@ -180,8 +189,10 @@ them into one deployment. Prototype code for all of this exists and runs.
 - **Documentation only.** Write the walkthrough without the code. Text
   cannot be run, and authorization mistakes only show up when something
   executes. Still worth doing alongside hub, not instead of it.
-- **External repository.** The project loses control of the reference and
-  the community fragments further.
+- **Subproject under kcp-dev.** Gives the project control of the reference
+  and keeps the community in one place, at the cost of a scope change for
+  kcp, a formal vote, and maintainer load for code they did not choose.
+  Possible later if hub proves itself.
 - **Extend the deployment reference.** Add api-syncagent and examples to the
   multi-shard setup. That shows how to run kcp, not how to build on it.
   Complementary to hub and can happen independently.
