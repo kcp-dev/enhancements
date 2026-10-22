@@ -55,7 +55,7 @@ by decoupling the identity and secrets.
 ### APIExport API
 
 The APIExports `status.identityHash` is deprecated and no longer read
-except for filling `spec.identity.name` on upgrade.
+except for filling `spec.identity.value` on upgrade.
 
 ```yaml
 apiVersion: apis.kcp.io/v1alpha2
@@ -72,7 +72,7 @@ spec:
     # New APIExport identity.
     # If unset filled with the current `status.identityHash`.
     # If unset and `status.identityHash` is empty a random 64 character alphanumeric string is generated.
-    name: <alphanumeric string>
+    value: <alphanumeric string>
 
   secretRef:
     # must be in kcp-system
@@ -89,9 +89,9 @@ status:
   # marked deprecated, unused
   identityHash: <hex-sha256-of-current-secret-data-key>
 
-  # written by controller after validating, either `spec.identity.name` or empty
+  # written by controller after validating, either `spec.identity.value` or empty
   # protected by admission
-  identity: <value of .spec.identity.name>
+  identity: <value of .spec.identity.value>
 
   # status.writers is computed from .spec.secretRef and concat'ed with .spec.writers
   # written by controller after validating
@@ -101,7 +101,7 @@ status:
     - credentialHash: <hex-sha256-of-next-secret-data-key>
 ```
 
-The `spec.identity.name` is immutable once set.
+The `spec.identity.value` is immutable once set.
 
 ### Authoritative Registration
 
@@ -133,7 +133,7 @@ the name being the identity.
 apiVersion: registry.kcp.io/v1alpha1
 kind: APIIdentity
 metadata:
-  name: <spec.identity.name>
+  name: <spec.identity.value>
 spec:
   owner:
     ref:
@@ -202,7 +202,7 @@ swapping the entry in `spec.writers`.
 ## Changes, Compatibility and Migration
 
 1. Add `registry.kcp.io` and establish shared scope in cache-server.
-2. Add `spec.secretRef`, `spec.identity.name`, etc.pp. and update APIExport controller to establish the APIIdentity ownership in the cache-server.
+2. Add `spec.secretRef`, `spec.identity.value`, etc.pp. and update APIExport controller to establish the APIIdentity ownership in the cache-server.
 3. Update every component to reference `status.identity`, and refuse to act if it is empty.
 4. Update controller to validate and confirmed write the APIExport to the cache-server.
 
