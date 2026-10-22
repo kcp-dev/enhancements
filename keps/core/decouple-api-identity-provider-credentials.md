@@ -162,11 +162,18 @@ Only once all consumers are gone the APIIdentity is freed for reuse.
 As a consequence a provider also cannot reclaim an APIIdentity with
 active consumers if they deleted the APIExport.
 
-When an APIExport is created it first tries to claim the APIIdentity.
-If the APIIdentity already exists the referenced secret is validated
-against the allowed writes in the owning APIExport.
-If it is authorized the APIExport is active and reconciled as usualy.
-If it is not authorized it goes into a failstate and is no requeued.
+When an APIExport is created the controller first tries to claim the APIIdentity for it.
+
+If the APIIdentity does not exist it is created and the APIExport is entered as the owner.
+
+If it does exist the `status.writers` is retrieved and validated against the APIExports `spec.secretRef`.
+
+If the `spec.secretRef` matches any of the `status.writers` (e.g. the
+referenced secrets hex-sha256 sum matches an entries `credentialHash`)
+the APIExport is allowed to serve an API with that identity.
+
+If that is not the case the APIExport goes into a failstate is not
+requeued.
 
 A separate reconciler watches the APIIdentities in the cache-server in
 the shared scope. When the `status.writers` changes it rechecks and
