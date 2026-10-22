@@ -80,7 +80,7 @@ spec:
     # if unset falls back to `spec.identity.secretRef`
 
   # additional credentials allowed to serve the same API identity
-  writers:
+  allowedCredentials:
     - credentialHash: <hex-sha256-of-next-secret-data-key>
 
   resources: []
@@ -93,10 +93,10 @@ status:
   # protected by admission
   identity: <value of .spec.identity.value>
 
-  # status.writers is computed from .spec.secretRef and concat'ed with .spec.writers
+  # status.allowedCredentials is computed from .spec.secretRef and concat'ed with .spec.allowedCredentials
   # written by controller after validating
   # protected by admission
-  writers:
+  allowedCredentials:
     - credentialHash: <hex-sha256-of-current-secret-data-key>
     - credentialHash: <hex-sha256-of-next-secret-data-key>
 ```
@@ -141,17 +141,18 @@ spec:
       name: widgets
       uid: 1234
 status:
-  # filled from the status.writers of the owning APIExport
-  writers: []
+  # filled from the status.allowedCredentials of the owning APIExport
+  allowedCredentials: []
 ```
 
 This allows an APIExport to claim this API identity globally across the
 kcp instance.
 
-The writers in the status are updated from the owning APIExport.
+The allowedCredentials in the status are updated from the owning APIExport.
 
 When the APIExport is deleted the APIIdentity it owns is transferred to
-the next oldest authorized APIExport based on the `status.writers`.
+the next oldest authorized APIExport based on the
+`status.allowedCredentials`.
 
 When no other authorized APIExports exist all shards with consumers of
 the APIExport, determined by the APIExportES, are requeuing the
@@ -166,9 +167,9 @@ When an APIExport is created the controller first tries to claim the APIIdentity
 
 If the APIIdentity does not exist it is created and the APIExport is entered as the owner.
 
-If it does exist the `status.writers` is retrieved and validated against the APIExports `spec.secretRef`.
+If it does exist the `status.allowedCredentials` is retrieved and validated against the APIExports `spec.secretRef`.
 
-If the `spec.secretRef` matches any of the `status.writers` (e.g. the
+If the `spec.secretRef` matches any of the `status.allowedCredentials` (e.g. the
 referenced secrets hex-sha256 sum matches an entries `credentialHash`)
 the APIExport is allowed to serve an API with that identity.
 
@@ -176,7 +177,7 @@ If that is not the case the APIExport goes into a failstate is not
 requeued.
 
 A separate reconciler watches the APIIdentities in the cache-server in
-the shared scope. When the `status.writers` changes it rechecks and
+the shared scope. When the `status.allowedCredentials` changes it rechecks and
 validates the APIExports on the shard.
 
 As a consequence every reconciler using an APIExport must check
@@ -199,12 +200,12 @@ that the `cache-server` replicates shard-owned data to other shards. The
 ### Authorization, Revocation and Rotating secrets
 
 Whichever APIExport is named as the owner in the APIIdentity is the
-authoritative source of the allowed writers to serve an API.
+authoritative source of the allowedCredentials to serve an API.
 
-Revoking is replacing `spec.secretRef` or removing the respective entry from `spec.writers`.
+Revoking is replacing `spec.secretRef` or removing the respective entry from `spec.allowedCredentials`.
 
 Rotating is adding a new secret and updating `spec.secretRef` or
-swapping the entry in `spec.writers`.
+swapping the entry in `spec.allowedCredentials`.
 
 ## Changes, Compatibility and Migration
 
