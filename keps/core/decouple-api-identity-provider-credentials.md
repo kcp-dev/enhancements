@@ -223,11 +223,30 @@ intervention needed.
 
 ## Other considerations
 
-Identity squatting: As long as a party owns an identity they maintain
-control of it through the APIIdentity mechanics. If a provider releases
-control of an APIIdentity it is a concious decision by the provider.
+### Identity squatting
+
+As long as a party owns an identity they maintain control of it through
+the APIIdentity mechanics. If a provider releases control of an
+APIIdentity it is a concious decision by the provider.
 
 Squatting outside of that can only happen when a provider deliberately
 chooses guessable identities and does not pre-claim those identities.
 
 A method to claim e.g. prefixes is not considered.
+
+### Removing secrets alltogether
+
+While technically possible it would be a very large change that needs
+much more careful consideration.
+
+API identities are used to identify exported APIs, even when e.g.
+claiming another API from an APIExport: provider A exports API M,
+provider B exports API Z, which also uses API M and claims some of its
+resources).
+
+To facilitate this API identities are required and must be publicly known.
+
+The alternative would be to fix APIs to the logical cluster they
+originate from - which would make serving an API from different
+workspaces (e.g. to migrate) or to rehome an APIExport over time
+impossible.
