@@ -74,10 +74,11 @@ spec:
     # If unset and `status.identityHash` is empty a random 64 character alphanumeric string is generated.
     value: <alphanumeric string>
 
-  secretRef:
-    # must be in kcp-system
-    name: widgets
+  credentials:
     # if unset falls back to `spec.identity.secretRef`
+    ref:
+      # must be in kcp-system
+      name: widgets
 
   # additional credentials allowed to serve the same API identity
   allowedCredentials:
@@ -93,7 +94,7 @@ status:
   # protected by admission
   identity: <value of .spec.identity.value>
 
-  # status.allowedCredentials is computed from .spec.secretRef and concat'ed with .spec.allowedCredentials
+  # status.allowedCredentials is computed from .spec.credentials and concat'ed with .spec.allowedCredentials
   # written by controller after validating
   # protected by admission
   allowedCredentials:
@@ -167,9 +168,9 @@ When an APIExport is created the controller first tries to claim the APIIdentity
 
 If the APIIdentity does not exist it is created and the APIExport is entered as the owner.
 
-If it does exist the `status.allowedCredentials` is retrieved and validated against the APIExports `spec.secretRef`.
+If it does exist the `status.allowedCredentials` is retrieved and validated against the APIExports `spec.credentials`.
 
-If the `spec.secretRef` matches any of the `status.allowedCredentials` (e.g. the
+If the `spec.credentials` matches any of the `status.allowedCredentials` (e.g. the
 referenced secrets hex-sha256 sum matches an entries `credentialHash`)
 the APIExport is allowed to serve an API with that identity.
 
@@ -202,15 +203,15 @@ that the `cache-server` replicates shard-owned data to other shards. The
 Whichever APIExport is named as the owner in the APIIdentity is the
 authoritative source of the allowedCredentials to serve an API.
 
-Revoking is replacing `spec.secretRef` or removing the respective entry from `spec.allowedCredentials`.
+Revoking is replacing `spec.credentials` or removing the respective entry from `spec.allowedCredentials`.
 
-Rotating is adding a new secret and updating `spec.secretRef` or
+Rotating is adding a new secret and updating `spec.credentials` or
 swapping the entry in `spec.allowedCredentials`.
 
 ## Changes, Compatibility and Migration
 
 1. Add `registry.kcp.io` and establish shared scope in cache-server.
-2. Add `spec.secretRef`, `spec.identity.value`, etc.pp. and update APIExport controller to establish the APIIdentity ownership in the cache-server.
+2. Add `spec.credentials`, `spec.identity.value`, etc.pp. and update APIExport controller to establish the APIIdentity ownership in the cache-server.
 3. Update every component to reference `status.identity`, and refuse to act if it is empty.
 4. Update controller to validate and confirmed write the APIExport to the cache-server.
 
