@@ -36,28 +36,33 @@ treat each shard as equal in capacity
 * Allow users to provide their own scheduling algorithm. While we want to do this eventually, this
   is not the goal of the initial proposal, but will be possible long-term since the algorithm is
   pluggable
+* Removing the direct shard-to-shard writes that create and delete a LogicalCluster on the chosen
+  shard. This proposal only changes who decides where a LogicalCluster goes, not who executes
+  the placement. See the alternatives section for the model that would remove them, but requires
+  lots of changes to our existing model.
 
 ## Proposal
 
 Add a scheduler component to FrontProxy which handles requests for workspaces. Whenever a new
 workspace gets created, it uses the following P2C algorithm to figure out on which shard the
-logicalcluster should be scheduled on:
+LogicalCluster should be scheduled on:
 
   1. Draw 2 shards at random from the list of available shards
-  2. Compare number of logicalclusters on both shards
-  3. Schedule logicalcluster on the shard with the lowest number of logicalclusters
+  2. Compare number of LogicalClusters on both shards
+  3. Pick the shard with the lowest number and set the `tenancy.kcp.io/shard` annotation on the Workspace
+  4. Create the Workspace object on the parent shard
+
+Afterwards the scheduling process of the LogicalCluster takes place (Note: This part is completely
+unchanged by this proposal):
+
+  1. Shard with the new Workspace object reads `tenancy.kcp.io/shard` value and creates the LogicalCluster
+     on that shard
+  2. Shard with new Workspace object sets spec.cluster and spec.URL on workspace object
+  3. Shard with new LogicalCluster replicates the readiness via status to CacheServer
+  4. Shard with new Workspace object watches CacheServer and updates Workspace status
 
 The functionality will be made available under a feature flag `--logical-cluster-scheduling="p2c"` in
 FrontProxy.
-
-In order to further minimize traffic between shards, workspace requests which get sent to a shard
-directly will have their logicalcluster scheduled on the same shard. No more cross-communication
-between shards on scheduling.
-
-<TBD, should we just schedule logicalclusters always on the same shard as their workspace? This
-makes scheduling in FrontProxy easier, as it just creates the workspace object on the corresponding
-shard, as well as automatically removing the need for any shards to talk to each other once a shard
-receives a scheduling request>
 
 ### Why P2C
 
@@ -67,6 +72,33 @@ converges to the same placement rate over time
 * Completely stateless, does not require us to keep any information on past schedulings
 
 ## Alternatives Considered
+
+### Always schedule the LogicalCluster on the same shard as its Workspace
+
+This would remove the shard-to-shard write for LogicalCluster creation entirely. However Workspaces
+and LogicalClusters could only be scheduled on their parents shard, resulting in single-shard hierarchies,
+which defeats the whole purpose of this proposal.
+
+### FrontProxy decides and executes the placement
+
+Instead of only stamping the decision onto the Workspace, FrontProxy would perform the whole
+placement: pick a shard via P2C, create the LogicalCluster on that shard directly, and then create
+the Workspace on the parent's shard with `spec.cluster`, `spec.URL` and the shard annotation already
+set. The parent shard's controller would only track phase through the cache server, and
+shard-to-shard writes for creation would disappear, replaced by FrontProxy-to-shard writes, which
+is traffic FrontProxy already produces for its index. Deletion would be inverted as well: the owning
+shard would garbage-collect its LogicalCluster when the owning Workspace disappears, observed through
+the cache server. A variant of this is a pull-based claim model, where shards watch replicated
+placement intent and claim Workspaces addressed to them.
+
+This is the direction we think scheduling should eventually move, since it aligns with the principle
+that no shard connects to another shard directly. We did not choose it as the initial step because
+it changes several general principles at once: FrontProxy becomes a writer of LogicalClusters rather
+than a pure router, LogicalCluster ownership moves out of the parent's workspace controller, and
+deletion through garbage collection requires Workspaces (or a new intent object) to be replicated to
+the cache server, which is a significant increase in replicated volume with its own trade-offs. The
+proposal above only changes who makes the scheduling decision and keeps the execution path as it is,
+which makes it a small, reversible step that can later be extended into this model.
 
 ### FrontProxy connects randomly to one shard, which places the scheduling request on the CacheServer
 
